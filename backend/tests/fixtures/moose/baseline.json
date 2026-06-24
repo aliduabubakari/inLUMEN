@@ -1,0 +1,20 @@
+{
+  "moose": {
+    "repository": "https://github.com/roby-avo/moose",
+    "ref": "origin/main",
+    "commit": "22efaf0d8cb15352147d6c43c5dfa5541360b8c5",
+    "commit_date": "2026-04-13T16:48:16+02:00",
+    "source_files": [
+      "src/moose_api/main.py",
+      "src/moose_api/queue.py",
+      "src/moose/config.py",
+      "src/moose/ner.py",
+      "src/moose/cpa.py",
+      "src/moose/privacy.py"
+    ]
+  },
+  "generated_runtime": {
+    "python_image": "python:3.12.13-slim-bookworm@sha256:76d4b7b6305788c6b4c6a19d6a22a3921bf802e9af4d5e1e5bd771208dba74bf",
+    "httpx": "0.28.1"
+  }
+}

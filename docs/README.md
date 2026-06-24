@@ -32,6 +32,9 @@ The picture below shows the component in the DATAPACT architecture.
 
 The current local deployment uses a simple gateway architecture. Frontend and CLI clients call only the backend gateway API; Neo4j, MinIO, and the OpenAI-compatible LLM provider remain behind the backend boundary.
 
+The generated SemT node boundary is documented in the
+[SemT runtime data contract](./semt-runtime-contract.md).
+
 
 ![Current inLUMEN Architecture](./images/current-architecture.svg)
 
@@ -100,6 +103,8 @@ docker compose up --build
 
 The default `docker-compose.yml` is optimized for local development and exposes Neo4J and MinIO inspection ports. Neo4J is available at `localhost:7474` and `localhost:7687`; MinIO is available at `localhost:9000` with console access at `localhost:9099`. You can override those inspection ports with `NEO4J_HTTP_PORT`, `NEO4J_BOLT_PORT`, `MINIO_S3_PORT`, and `MINIO_CONSOLE_PORT`.
 
+Neo4J stores its database in the Docker-managed `inlumen_neo4j_data` volume. A normal `docker compose down` followed by `docker compose up --build` preserves this data. Use `docker compose down --volumes` only when you intentionally want to delete the local graph and start with an empty database.
+
 For deployment/production-like runs, use the production compose file. It exposes only the frontend and backend gateway on the host; Neo4J and MinIO stay private on the Compose network:
 
 ```
@@ -145,7 +150,7 @@ For the best macOS/Windows experience:
 
 Note: building the containers may take around 5 minutes, please wait until Neo4J is fully started.  
 
-Note: Once the installation is complete in dev mode, the local endpoints are localhost:8080 (frontend), localhost:5000 (inLUMEN backend gateway API), localhost:7474/7687 (Neo4J), and localhost:9000/9099 (MinIO). In production compose mode, only the frontend and backend gateway are exposed; Neo4J and MinIO stay private on the Compose network.
+Note: Once the installation is complete in dev mode, the local endpoints are localhost:8080 (frontend), localhost:5001 (inLUMEN backend gateway API), localhost:7474/7687 (Neo4J), and localhost:9000/9099 (MinIO). In production compose mode, only the frontend and backend gateway are exposed; Neo4J and MinIO stay private on the Compose network.
 
 Note: To log into MinIO, use the configured root credentials from `.env`. For security reasons, change these values before using the stack outside local development.
 
@@ -165,7 +170,7 @@ API key handling:
 
 ## **Gateway API and Swagger**
 
-The gateway API is served by the inLUMEN backend API on `INLUMEN_API_PORT`, which is `5000` by default.
+The gateway API is served by the inLUMEN backend API on `INLUMEN_API_PORT`, which is `5001` by default.
 
 Required gateway API environment variable when `AUTH_ENABLED=false`:
 
@@ -175,12 +180,12 @@ API_AUTH_TOKEN=change-me-local-token
 
 Local URLs:
 
-- Swagger UI: `http://localhost:5000/docs`
-- OpenAPI JSON schema: `http://localhost:5000/openapi.json`
-- Health check: `http://localhost:5000/health`
-- Readiness check: `http://localhost:5000/ready`
+- Swagger UI: `http://localhost:5001/docs`
+- OpenAPI JSON schema: `http://localhost:5001/openapi.json`
+- Health check: `http://localhost:5001/health`
+- Readiness check: `http://localhost:5001/ready`
 
-Swagger UI is enabled by default. Open `http://localhost:5000/docs`, enter a bearer token, then use the Swagger `Authorize` button or the pre-filled bearer auth to run live requests. The live schema documents both the integration-oriented `/api/v1/*` endpoints and the UI-equivalent gateway endpoints for canvas graph editing, file operations, pipeline version management, chat, and deployment artifact generation.
+Swagger UI is enabled by default. Open `http://localhost:5001/docs`, enter a bearer token, then use the Swagger `Authorize` button or the pre-filled bearer auth to run live requests. The live schema documents both the integration-oriented `/api/v1/*` endpoints and the UI-equivalent gateway endpoints for canvas graph editing, file operations, pipeline version management, chat, and deployment artifact generation.
 
 When `AUTH_ENABLED=false`, authentication uses a static bearer token:
 
@@ -199,34 +204,34 @@ The API validates Keycloak JWTs with `KEYCLOAK_JWKS_URL`, checks `KEYCLOAK_ISSUE
 Example requests:
 
 ```
-curl http://localhost:5000/health
+curl http://localhost:5001/health
 
 curl -H "Authorization: Bearer $API_AUTH_TOKEN_OR_KEYCLOAK_JWT" \
-  http://localhost:5000/openapi.json
+  http://localhost:5001/openapi.json
 
 curl -H "Authorization: Bearer $API_AUTH_TOKEN_OR_KEYCLOAK_JWT" \
-  http://localhost:5000/api/v1/pipelines
+  http://localhost:5001/api/v1/pipelines
 
-curl -X POST http://localhost:5000/api/v1/pipelines \
+curl -X POST http://localhost:5001/api/v1/pipelines \
   -H "Authorization: Bearer $API_AUTH_TOKEN_OR_KEYCLOAK_JWT" \
   -H "Content-Type: application/json" \
   -d '{"name":"Remote patient monitoring","description":"Integration-ready pipeline"}'
 
 curl -H "Authorization: Bearer $API_AUTH_TOKEN_OR_KEYCLOAK_JWT" \
-  "http://localhost:5000/api/v1/workflows?include_download_urls=true"
+  "http://localhost:5001/api/v1/workflows?include_download_urls=true"
 
 curl -H "Authorization: Bearer $API_AUTH_TOKEN_OR_KEYCLOAK_JWT" \
-  http://localhost:5000/api/v1/pipelines/pipeline-123/artifacts/dockerfiles
+  http://localhost:5001/api/v1/pipelines/pipeline-123/artifacts/dockerfiles
 
 curl -H "Authorization: Bearer $API_AUTH_TOKEN_OR_KEYCLOAK_JWT" \
-  http://localhost:5000/api/v1/pipelines/pipeline-123/artifacts/argo-workflow.yaml
+  http://localhost:5001/api/v1/pipelines/pipeline-123/artifacts/argo-workflow.yaml
 
-curl -X POST http://localhost:5000/api/graph/nodes \
+curl -X POST http://localhost:5001/api/graph/nodes \
   -H "Authorization: Bearer $API_AUTH_TOKEN_OR_KEYCLOAK_JWT" \
   -H "Content-Type: application/json" \
   -d '{"properties":{"flow_id":"retrieve","label":"Retrieve","type":"input","x":100,"y":120}}'
 
-curl -X POST http://localhost:5000/simple_chat \
+curl -X POST http://localhost:5001/simple_chat \
   -H "Authorization: Bearer $API_AUTH_TOKEN_OR_KEYCLOAK_JWT" \
   -H "Content-Type: application/json" \
   -d '{"user_message":"Add a retrieval step and connect it to processing","canvas_graph":{"nodes":[],"edges":[]}}'
@@ -252,7 +257,7 @@ inLUMEN is still under development, any current users should expect unstable beh
 
 ## **OpenAPI Specification**
 
-The live OpenAPI 3 schema is available at `http://localhost:5000/openapi.json` with bearer authentication. The schema is the source used by Swagger UI at `http://localhost:5000/docs`.
+The live OpenAPI 3 schema is available at `http://localhost:5001/openapi.json` with bearer authentication. The schema is the source used by Swagger UI at `http://localhost:5001/docs`.
 
 ## **Additional Links**
 

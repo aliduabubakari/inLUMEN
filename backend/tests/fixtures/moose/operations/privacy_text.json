@@ -1,0 +1,90 @@
+{
+  "operation": "privacy_text",
+  "endpoint": "/privacy/analyze",
+  "request": {
+    "profile": "balanced",
+    "tasks": [
+      {
+        "kind": "text",
+        "task_id": "privacy-text-1",
+        "text": "We collect patient names and emails for billing."
+      }
+    ],
+    "llm": {
+      "provider": "openrouter",
+      "model": "anthropic/claude-3.5-sonnet"
+    }
+  },
+  "queued_response": {
+    "job_id": "44444444444444444444444444444444",
+    "status": "queued"
+  },
+  "completed_job": {
+    "job_id": "44444444444444444444444444444444",
+    "status": "completed",
+    "created_at": "2026-04-13T14:03:00+00:00",
+    "updated_at": "2026-04-13T14:03:01+00:00",
+    "result": {
+      "profile": "balanced",
+      "policy_pack": "gdpr_basic",
+      "action_catalog": [],
+      "results": [
+        {
+          "task_id": "privacy-text-1",
+          "kind": "text",
+          "policy_pack": "gdpr_basic",
+          "findings": [],
+          "extraction": {
+            "task_id": "privacy-text-1",
+            "entities": [
+              {
+                "start": 11,
+                "end": 24,
+                "text": "patient names",
+                "type_id": "dpv-pd:Identifying",
+                "confidence": 0.94
+              }
+            ]
+          }
+        }
+      ],
+      "reports": {
+        "human_readable": {
+          "format": "markdown",
+          "content": "# Privacy Analysis Report\n"
+        },
+        "machine_readable": {
+          "schema_id": "moose.privacy.machine_report.v1",
+          "schema_version": "1.0.0",
+          "content": {
+            "report_type": "privacy_analysis",
+            "schema_id": "moose.privacy.machine_report.v1",
+            "schema_version": "1.0.0",
+            "generated_at": "2026-04-13T14:03:01+00:00",
+            "profile": "balanced",
+            "policy_pack": "gdpr_basic",
+            "summary": {
+              "task_count": 1,
+              "finding_count": 0,
+              "severity_counts": {},
+              "status_counts": {},
+              "assessment_counts": {},
+              "action_counts": {}
+            },
+            "tasks": [
+              {
+                "task_id": "privacy-text-1",
+                "kind": "text",
+                "table_id": null,
+                "finding_count": 0,
+                "findings": []
+              }
+            ],
+            "warnings": [],
+            "escalations": []
+          }
+        }
+      }
+    }
+  }
+}

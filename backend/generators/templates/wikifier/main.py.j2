@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Deterministic inLUMEN Wikifier runtime for flow {{ flow_id_literal }}."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import requests
+
+
+CONFIG = json.loads({{ configuration_literal }})
+PARAMETERS = dict(CONFIG.get("parameters") or {})
+CONNECTION_REF = str(CONFIG.get("connection_ref") or "")
+CONTRACT_VERSION = "{{ contract_version }}"
+WIKIFIER_ENDPOINT = "/annotate-article"
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+LOGGER = logging.getLogger("inlumen.wikifier")
+
+
+def _json_value(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return value
+
+
+def load_records(path: Path) -> list[dict[str, Any]]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return [
+            {key: _json_value(value) for key, value in record.items()}
+            for record in pd.read_csv(path).to_dict(orient="records")
+        ]
+    if suffix != ".json":
+        raise ValueError(f"Unsupported input encoding {suffix!r}; use .csv or .json.")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and isinstance(payload.get("records"), list):
+        return [
+            dict(record)
+            for record in payload["records"]
+            if isinstance(record, dict)
+        ]
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        return [
+            dict(record)
+            for record in payload["items"]
+            if isinstance(record, dict)
+        ]
+    if isinstance(payload, list):
+        return [dict(record) for record in payload if isinstance(record, dict)]
+    if isinstance(payload, dict) and isinstance(payload.get("semt_table"), dict):
+        payload = payload["semt_table"]
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("columns"), dict)
+        and isinstance(payload.get("rows"), dict)
+    ):
+        columns = list(payload["columns"].keys())
+        records = []
+        for row in payload["rows"].values():
+            cells = row.get("cells") if isinstance(row, dict) else {}
+            records.append(
+                {
+                    column: (cells.get(column) or {}).get("label")
+                    for column in columns
+                }
+            )
+        return records
+    raise ValueError("JSON input must be records, items, or an inLUMEN table.")
+
+
+def write_records(records: list[dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    envelope = {
+        "schema_version": 1,
+        "kind": "inlumen.table",
+        "contract_version": CONTRACT_VERSION,
+        "records": records,
+    }
+    path.write_text(
+        json.dumps(envelope, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def wikifier_base_url() -> str:
+    return os.getenv("WIKIFIER_API_BASE_URL", "https://www.wikifier.org").strip().rstrip("/")
+
+
+def wikifier_user_key() -> str:
+    user_key = os.getenv("WIKIFIER_USER_KEY", "").strip()
+    if not user_key:
+        raise RuntimeError(
+            "WIKIFIER_USER_KEY is required at runtime. "
+            f"Connection profile: {CONNECTION_REF or 'unspecified'}."
+        )
+    return user_key
+
+
+def compact_annotations(response: dict[str, Any]) -> dict[str, Any]:
+    annotations = response.get("annotations")
+    if not isinstance(annotations, list):
+        annotations = []
+
+    def values(name: str) -> list[Any]:
+        return [
+            annotation.get(name)
+            for annotation in annotations
+            if isinstance(annotation, dict) and annotation.get(name) not in (None, "")
+        ]
+
+    wikidata_ids: list[str] = []
+    for annotation in annotations:
+        if not isinstance(annotation, dict):
+            continue
+        item_id = annotation.get("wikiDataItemId")
+        if isinstance(item_id, str) and item_id:
+            wikidata_ids.append(item_id)
+        class_ids = annotation.get("wikiDataClassIds")
+        if isinstance(class_ids, list):
+            wikidata_ids.extend(
+                item for item in class_ids if isinstance(item, str) and item
+            )
+
+    return {
+        "wikifier_annotation_count": len(annotations),
+        "wikifier_titles": values("title"),
+        "wikifier_urls": values("url"),
+        "wikifier_dbpedia_iris": values("dbPediaIri"),
+        "wikifier_wikidata_ids": sorted(set(wikidata_ids)),
+    }
+
+
+def call_wikifier(text: str) -> dict[str, Any]:
+    timeout = float(os.getenv("WIKIFIER_TIMEOUT_SECONDS", "60"))
+    threshold = float(PARAMETERS.get("threshold", 0.8))
+    data = {
+        "text": text,
+        "lang": str(PARAMETERS.get("language") or "en"),
+        "userKey": wikifier_user_key(),
+        "pageRankSqThreshold": "%g" % threshold,
+        "applyPageRankSqThreshold": "true",
+        "wikiDataClasses": "true",
+        "wikiDataClassIds": "false",
+        "support": "true",
+        "ranges": "false",
+        "includeCosines": "false",
+        "maxMentionEntropy": "3",
+        "minLinkFrequency": "2",
+    }
+    response = requests.post(
+        wikifier_base_url() + WIKIFIER_ENDPOINT,
+        data=data,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Wikifier returned a non-object JSON response.")
+    return payload
+
+
+def execute_operation(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source_column = str(PARAMETERS["source_column"])
+    output_mode = str(PARAMETERS.get("output_mode") or "compact_and_raw")
+    if records and source_column not in records[0]:
+        raise RuntimeError(f"Source column {source_column!r} was not found in input records.")
+    output: list[dict[str, Any]] = []
+    for record in records:
+        next_record = dict(record)
+        text = next_record.get(source_column)
+        if text is None or str(text).strip() == "":
+            response: dict[str, Any] = {"annotations": []}
+        else:
+            response = call_wikifier(str(text))
+
+        if output_mode == "compact_and_raw":
+            next_record.update(compact_annotations(response))
+        next_record["wikifier_raw_json"] = response
+        output.append(next_record)
+    return output
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run one deterministic Wikifier node.")
+    parser.add_argument(
+        "--input",
+        default=os.getenv("INLUMEN_INPUT_PATH", "/data/input.json"),
+    )
+    parser.add_argument(
+        "--output",
+        default=os.getenv("INLUMEN_OUTPUT_PATH", "/data/output.json"),
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input table not found: {input_path}")
+
+    LOGGER.info(
+        "Running Wikifier operation=%s source_column=%s connection_ref=%s",
+        CONFIG["operation"],
+        PARAMETERS["source_column"],
+        CONNECTION_REF,
+    )
+    records = load_records(input_path)
+    result = execute_operation(records)
+    write_records(result, output_path)
+    print(
+        json.dumps(
+            {
+                "contract": "inlumen.table",
+                "contract_version": CONTRACT_VERSION,
+                "input": str(input_path),
+                "output": str(output_path),
+                "rows": len(result),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

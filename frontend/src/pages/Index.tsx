@@ -404,6 +404,9 @@ const Index = () => {
     setFlowNodes(prev => prev.map(node =>
       node.id === id ? { ...node, data: { ...node.data, ...data } } : node
     ));
+    setSelectedNode(prev =>
+      prev?.id === id ? { ...prev, data: { ...prev.data, ...data } } : prev
+    );
     flowCanvasRef.current?.updateNode(id, data);
   }, []);
 

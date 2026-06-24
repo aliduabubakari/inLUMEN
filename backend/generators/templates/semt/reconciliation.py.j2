@@ -1,0 +1,128 @@
+# ---------------------------------------------------------------------------
+# Reconciliation-specific helpers
+# ---------------------------------------------------------------------------
+
+def _build_reconciler_props() -> dict[str, Any]:
+    """Build extra_params dict from catalog parameters for the reconciler."""
+    extra: dict[str, Any] = {}
+    for key, value in PARAMETERS.items():
+        if key in (
+            "api_base_url", "username", "password", "token",
+            "dataset_id", "table_id", "connection_ref",
+            "column_name", "optional_columns",
+        ):
+            continue
+        if isinstance(value, (dict, list)):
+            extra[key] = value
+        elif isinstance(value, bool):
+            extra[key] = value
+        elif isinstance(value, (int, float)):
+            extra[key] = value
+        elif isinstance(value, str) and value.strip():
+            extra[key] = value
+    return extra
+
+
+def _backend_reconcile(
+    table: dict[str, Any],
+    dataset_id: str,
+    table_id: str,
+    reconciliator_id: str,
+    column_name: str,
+    optional_columns: list[str],
+    extra_params: dict[str, Any],
+) -> dict[str, Any]:
+    """Perform reconciliation via the SemT backend: fetch → reconcile → push."""
+    base_url = _resolve_api_base_url()
+    auth_manager = build_auth_manager()
+
+    reconciliation_manager = ReconciliationManager(base_url.rstrip("/"), auth_manager)
+    table_manager = TableManager(base_url.rstrip("/"), auth_manager)
+    utility = Utility(base_url.rstrip("/"), auth_manager)
+
+    LOGGER.info("Fetching table %s from dataset %s", table_id, dataset_id)
+    table_data = table_manager.get_table(dataset_id, table_id)
+    if not isinstance(table_data, dict):
+        raise RuntimeError(
+            f"Failed to retrieve table {table_id} from dataset {dataset_id}."
+        )
+
+    LOGGER.info(
+        "Reconciling column=%s  reconciliator=%s  optional_columns=%s",
+        column_name, reconciliator_id,
+        json.dumps(optional_columns),
+    )
+    reconciled_table, backend_payload = reconciliation_manager.reconcile(
+        table_data=table_data,
+        column_name=column_name,
+        reconciliator_id=reconciliator_id,
+        optional_columns=optional_columns,
+        deduplicate=True,
+    )
+
+    if not isinstance(reconciled_table, dict):
+        raise RuntimeError("SemT reconciliation returned no table.")
+
+    LOGGER.info("Pushing reconciled table back to backend ...")
+    success_msg, _ = utility.push_to_backend(
+        dataset_id, table_id, backend_payload
+    )
+    LOGGER.info(success_msg)
+
+    return reconciled_table
+
+
+# ---------------------------------------------------------------------------
+# Operation entry point
+# ---------------------------------------------------------------------------
+
+def execute_operation(table: dict[str, Any]) -> dict[str, Any]:
+    """Reconcile a column using a SemT reconciliation service.
+
+    In backend mode (dataset_id + table_id available) the table is
+    fetched from / pushed to the SemT backend automatically.
+    In file mode the table is reconciled locally (legacy / testing).
+    """
+    reconciliator_id = SERVICE_ID
+    column_name = str(PARAMETERS.get("column_name") or "")
+    optional_columns = list(PARAMETERS.get("optional_columns") or [])
+    if not optional_columns:
+        optional_columns = list(PARAMETERS.get("additionalColumns") or [])
+    extra_params = _build_reconciler_props()
+
+    dataset_id = _DATASET_ID or str(PARAMETERS.get("dataset_id") or "").strip()
+    table_id = _TABLE_ID or str(PARAMETERS.get("table_id") or "").strip()
+
+    if dataset_id and table_id:
+        return _backend_reconcile(
+            table, dataset_id, table_id,
+            reconciliator_id, column_name,
+            optional_columns, extra_params,
+        )
+
+    # ── File-based mode (legacy / tests) ────────────────────────────────
+    auth_manager = build_auth_manager()
+    manager = ReconciliationManager(_resolve_api_base_url(), auth_manager)
+    result, _backend_payload = manager.reconcile(
+        table_data=table,
+        column_name=column_name,
+        reconciliator_id=reconciliator_id,
+        optional_columns=optional_columns,
+        deduplicate=True,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("SemT reconciliation returned no table.")
+    column = (result.get("columns") or {}).get(column_name)
+    if isinstance(column, dict) and not column.get("metadata"):
+        column["metadata"] = [
+            {
+                "id": "None:",
+                "match": True,
+                "score": 0,
+                "name": {"value": "", "uri": ""},
+                "type": [],
+                "property": [],
+                "entity": [],
+            }
+        ]
+    return result

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "kind": "inlumen.table",
+  "contract_version": "1",
+  "records": [
+    {
+      "name": "Alice",
+      "email": "alice@example.com"
+    }
+  ],
+  "semt_table": {
+    "table": {
+      "id": "customers"
+    },
+    "columns": {
+      "name": {
+        "status": "reconciled"
+      }
+    },
+    "rows": {
+      "0": {
+        "name": {
+          "metadata": {
+            "id": "Q42"
+          }
+        }
+      }
+    }
+  },
+  "extensions": {
+    "moose": [
+      {
+        "schema_version": 1,
+        "flow_id": "moose-table-1",
+        "operation": "table_annotation",
+        "schema": "sti",
+        "result": {
+          "table_id": "customers",
+          "columns": [
+            {
+              "column": "name",
+              "type_id": "NE:PERSON",
+              "confidence": 0.95
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

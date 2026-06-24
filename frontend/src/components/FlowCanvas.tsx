@@ -444,7 +444,7 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
         position,
         data: {
           ...nodeData.data,
-          content: nodeData.data.type === 'input' ? '{input}' : '',
+          ...(nodeData.data.type === 'input' ? { content: '{input}' } : {}),
         },
       };
 

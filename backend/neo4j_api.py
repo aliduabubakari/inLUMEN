@@ -9,6 +9,11 @@ from urllib.parse import quote
 from runtime_config import add_cors_headers, get_neo4j_settings
 from step_types import normalize_step_type
 from minio_access import create_bucket, list_objects, read_object_bytes, remove_object, upload_object
+from node_definitions.instance import (
+    definition_data_from_properties,
+    definition_properties_from_data,
+    normalize_definition_properties,
+)
 
 NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD = get_neo4j_settings()
 
@@ -160,6 +165,7 @@ def _parse_visible_graph(graph: dict) -> tuple[list[dict], list[dict]]:
             "x": x,
             "y": y,
         }
+        props.update(definition_properties_from_data(data))
         if step_type in ("input", "output"):
             props["content"] = str(data.get("content") or "")
             props["has_files"] = "yes" if files else str(data.get("has_files") or "no").lower().strip()
@@ -725,6 +731,7 @@ def neo4j_add_node():
         properties.pop("position", None)
     properties.setdefault("x", 0)
     properties.setdefault("y", 0)
+    normalize_definition_properties(properties)
     # Normalize to floats (Neo4j-friendly)
     try:
         properties["x"] = float(properties.get("x", 0) or 0)
@@ -884,6 +891,7 @@ def neo4j_update_node():
     # Changes in label/description
     properties["label"] = properties.get("label", "")
     properties["description"] = properties.get("description", "")
+    normalize_definition_properties(properties)
     # Changes specific to config step type:
     if step_type == "config":
         # Convert param dict -> JSON string
@@ -931,6 +939,47 @@ def neo4j_update_node():
             return jsonify(record["n"]._properties), 200
     except Exception as e:
         print("[neo4j_api.py] Error executing Neo4j query:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/neo4j_update_generated_artifact', methods=['POST'])
+@require_auth
+def neo4j_update_generated_artifact():
+    data = request.get_json(silent=True) or {}
+    flow_id = str(data.get("flow_id") or "").strip()
+    generated_artifact = data.get("generated_artifact")
+    if not flow_id:
+        return jsonify({"error": "flow_id is required"}), 400
+    if not isinstance(generated_artifact, dict):
+        return jsonify({"error": "generated_artifact must be an object"}), 400
+
+    query = """
+    MATCH (n:STEP {flow_id: $flow_id})
+    OPTIONAL MATCH (p:PIPELINE)-[:HAS_STEP]->(n)
+    SET n.generated_artifact_json = $generated_artifact_json
+    SET p.updated_at = datetime()
+    RETURN n
+    """
+    try:
+        with driver.session() as session:
+            record = session.run(
+                query,
+                {
+                    "flow_id": flow_id,
+                    "generated_artifact_json": json.dumps(
+                        generated_artifact,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                },
+            ).single()
+            if not record:
+                return jsonify(
+                    {"error": f"No STEP node found with flow_id={flow_id}"}
+                ), 404
+            return jsonify(record["n"]._properties), 200
+    except Exception as e:
+        print("[neo4j_api.py] Error storing generated artifact:", e)
         return jsonify({"error": str(e)}), 500
     
 # Deletes all nodes and edges, returns STEP flow_ids deleted
@@ -1915,6 +1964,7 @@ def neo4j_get_graph():
                     except Exception:
                         parsed_param = {}
                     data["param"] = parsed_param if isinstance(parsed_param, dict) else {}
+                data.update(definition_data_from_properties(props))
 
                 nodes.append({
                     "id": node_id,

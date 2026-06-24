@@ -1,0 +1,37 @@
+{
+  "definitions": [
+    {
+      "id": "moose.analysis",
+      "version": 1,
+      "family": "moose",
+      "base_type": "action",
+      "operation": "analysis",
+      "palette": {
+        "label": "Moose Analysis",
+        "description": "Ontology and privacy analysis for text or table data",
+        "icon": "scan-search",
+        "color": "amber",
+        "order": 230
+      },
+      "editor": {
+        "kind": "moose",
+        "catalog": "operations"
+      },
+      "runtime": {
+        "generator": "moose",
+        "base_image": "python:3.12.13-slim-bookworm@sha256:76d4b7b6305788c6b4c6a19d6a22a3921bf802e9af4d5e1e5bd771208dba74bf"
+      },
+      "default_implementation": {
+        "kind": "moose",
+        "operation": "",
+        "schema": "",
+        "parameters": {},
+        "llm": {
+          "provider": "openrouter",
+          "model": ""
+        },
+        "connection_ref": "default-moose"
+      }
+    }
+  ]
+}

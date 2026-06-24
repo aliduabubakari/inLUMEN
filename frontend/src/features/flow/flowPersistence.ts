@@ -2,6 +2,10 @@ import { Edge, Node } from 'reactflow';
 import { apiFetch } from '@/utils/apiFetch';
 import { INLUMEN_API_URL } from '@/config/api';
 import { ChatbotConfig, buildLLMRequestConfig } from '@/services/chatbotService';
+import {
+  normalizeType,
+  pickBackendUpdatableProps,
+} from '@/features/nodes/nodeSchema';
 
 export const MAIN_PIPELINE_VERSION_UID = 'main';
 
@@ -48,15 +52,13 @@ export type PipelineOverviewMetadata = {
 
 export const addNodeToBackend = async (node: Node) => {
   try {
+    const nodeType = normalizeType(node.data?.type);
     const response = await apiFetch(`${INLUMEN_API_URL}/api/graph/nodes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         properties: {
-          flow_id: node.id,
-          label: node.data.label,
-          type: node.data?.type,
-          description: node.data?.description || "",
+          ...pickBackendUpdatableProps(node.id, node.data ?? {}, nodeType),
           x: node.position?.x ?? 0,
           y: node.position?.y ?? 0,
         },

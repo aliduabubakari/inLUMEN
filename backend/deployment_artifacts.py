@@ -31,6 +31,7 @@ DOCKERFILE_INSTRUCTIONS = {
 }
 DOCKERFILE_NAME_RE = re.compile(r"^Dockerfile\.([A-Za-z0-9][A-Za-z0-9_.-]*)$")
 STEP_ID_RE = re.compile(r"files-step-id-([^/]+)$")
+SEMT_INPUT_DEFINITION_ID = "core.input-data"
 
 
 class DeploymentArtifactValidationError(ValueError):
@@ -44,6 +45,18 @@ class DeploymentArtifactValidationError(ValueError):
 
 def _clean_string(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _json_object(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _sanitize_fragment(value: Any, fallback: str) -> str:
@@ -98,6 +111,16 @@ def normalize_file_refs(files: Any) -> List[dict]:
                 "filename": filename,
                 "bucket": bucket,
                 "step_id": step_id,
+                **(
+                    {"snapshot_bucket": _clean_string(entry.get("snapshot_bucket"))}
+                    if _clean_string(entry.get("snapshot_bucket"))
+                    else {}
+                ),
+                **(
+                    {"snapshot_object": _clean_string(entry.get("snapshot_object"))}
+                    if _clean_string(entry.get("snapshot_object"))
+                    else {}
+                ),
             }
         )
     return normalized
@@ -121,6 +144,16 @@ def _files_from_step_data(data: dict, flow_id: str) -> List[dict]:
                 "bucket": _clean_string(entry.get("bucket"))
                 or f"files-step-id-{flow_id}",
                 "step_id": flow_id,
+                **(
+                    {"snapshot_bucket": _clean_string(entry.get("snapshot_bucket"))}
+                    if _clean_string(entry.get("snapshot_bucket"))
+                    else {}
+                ),
+                **(
+                    {"snapshot_object": _clean_string(entry.get("snapshot_object"))}
+                    if _clean_string(entry.get("snapshot_object"))
+                    else {}
+                ),
             }
         )
 
@@ -167,12 +200,27 @@ def extract_pipeline_steps(pipeline_graph: Optional[dict], files: Any = None) ->
             "endpoint": _clean_string(step_data.get("endpoint")),
             "database": _clean_string(step_data.get("database")),
             "param": step_data.get("param") if isinstance(step_data.get("param"), dict) else {},
+            "definition_id": _clean_string(step_data.get("definition_id")),
+            "definition_version": step_data.get("definition_version"),
+            "implementation": (
+                step_data.get("implementation")
+                if isinstance(step_data.get("implementation"), dict)
+                else _json_object(step_data.get("implementation_json"))
+            ),
+            "configuration_status": _clean_string(step_data.get("configuration_status")),
+            "generated_artifact": (
+                step_data.get("generated_artifact")
+                if isinstance(step_data.get("generated_artifact"), dict)
+                else _json_object(step_data.get("generated_artifact_json"))
+            ),
             "files": normalize_file_refs(
                 [
                     {
                         "filename": f.get("filename"),
                         "bucket": f.get("bucket") or f"files-step-id-{flow_id}",
                         "step_id": flow_id,
+                        "snapshot_bucket": f.get("snapshot_bucket"),
+                        "snapshot_object": f.get("snapshot_object"),
                     }
                     for f in files_for_step
                     if isinstance(f, dict) and f.get("filename")
@@ -205,6 +253,19 @@ def extract_pipeline_steps(pipeline_graph: Optional[dict], files: Any = None) ->
             "endpoint": _clean_string(data.get("endpoint")),
             "database": _clean_string(data.get("database")),
             "param": param,
+            "definition_id": _clean_string(data.get("definition_id")),
+            "definition_version": data.get("definition_version"),
+            "implementation": (
+                data.get("implementation")
+                if isinstance(data.get("implementation"), dict)
+                else _json_object(data.get("implementation_json"))
+            ),
+            "configuration_status": _clean_string(data.get("configuration_status")),
+            "generated_artifact": (
+                data.get("generated_artifact")
+                if isinstance(data.get("generated_artifact"), dict)
+                else _json_object(data.get("generated_artifact_json"))
+            ),
             "files": _files_from_step_data(data, flow_id),
         }
 
@@ -219,6 +280,11 @@ def extract_pipeline_steps(pipeline_graph: Optional[dict], files: Any = None) ->
                 "endpoint": "",
                 "database": "",
                 "param": {},
+                "definition_id": "",
+                "definition_version": None,
+                "implementation": {},
+                "configuration_status": "",
+                "generated_artifact": {},
                 "files": [],
             }
         known = {(f["filename"], f.get("bucket", "")) for f in steps_by_id[step_id]["files"]}
@@ -265,6 +331,23 @@ def extract_pipeline_edges(pipeline_graph: Optional[dict]) -> List[dict]:
         seen.add(key)
         deduped.append(edge)
     return deduped
+
+
+def select_runtime_steps(
+    steps: Sequence[dict],
+) -> List[dict]:
+    """Exclude the file-backed Input Data boundary from SemT runtime images."""
+    has_semt_steps = any(
+        _clean_string(step.get("definition_id")).startswith("semt.")
+        for step in steps
+    )
+    if not has_semt_steps:
+        return list(steps)
+    return [
+        step
+        for step in steps
+        if _clean_string(step.get("definition_id")) != SEMT_INPUT_DEFINITION_ID
+    ]
 
 
 def _step_sort_key(flow_id: Any) -> Tuple[int, Any]:
@@ -381,18 +464,33 @@ def build_dockerfile_artifacts(
     deployment_agents.py so attached files and step semantics can be interpreted
     with natural-language context.
     """
-    steps = extract_pipeline_steps(pipeline_graph, files)
+    all_steps = extract_pipeline_steps(pipeline_graph, files)
+    steps = select_runtime_steps(all_steps)
     if not steps:
         raise ValueError("No pipeline steps were found for Dockerfile generation.")
 
-    dockerfiles = [_dockerfile_for_step(step) for step in steps]
+    from generators.registry import GeneratorRegistry
+
+    generator_registry = GeneratorRegistry()
+    runtime_artifacts = []
+    dockerfiles = []
+    for step in steps:
+        generator = generator_registry.generator_for_step(step)
+        if generator is None:
+            dockerfiles.append(_dockerfile_for_step(step))
+            continue
+        bundle = generator.generate(step, pipeline_graph)
+        runtime_artifacts.append(bundle.to_dict(include_content=True))
+        dockerfiles.append(bundle.dockerfile_artifact())
     validate_dockerfile_artifacts(dockerfiles, [step["flow_id"] for step in steps], steps)
     return {
         "dockerfiles": dockerfiles,
+        "runtime_artifacts": runtime_artifacts,
         "guardrails": {
             "valid": True,
             "checks": [
-                "one Dockerfile per pipeline step",
+                "one Dockerfile per executable pipeline step",
+                "registered deterministic generators bypass the generic runtime inference",
                 "Dockerfile filenames match Dockerfile.<step_id>",
                 "Dockerfiles include FROM, WORKDIR, build context handling, and CMD",
             ],
@@ -436,6 +534,11 @@ def validate_dockerfile_artifacts(
     expected_ids = {_clean_string(step_id) for step_id in (expected_step_ids or []) if _clean_string(step_id)}
     step_files = {
         _clean_string(step.get("flow_id")): [entry["filename"] for entry in step.get("files") or []]
+        for step in (steps or [])
+        if isinstance(step, dict)
+    }
+    steps_by_id = {
+        _clean_string(step.get("flow_id")): step
         for step in (steps or [])
         if isinstance(step, dict)
     }
@@ -487,6 +590,33 @@ def validate_dockerfile_artifacts(
             errors.append(f"{filename} must install requirements.txt")
         if any(name.lower().endswith(".sh") for name in files_for_step) and "chmod" not in content:
             errors.append(f"{filename} must make shell scripts executable")
+
+        step = steps_by_id.get(flow_id) or {}
+        if _clean_string(step.get("definition_id")).startswith("semt."):
+            image = _clean_string(artifact.get("image"))
+            configuration_hash = _clean_string(artifact.get("configuration_hash"))
+            build_context_files = {
+                _clean_string(name)
+                for name in (artifact.get("files") or [])
+                if _clean_string(name)
+            }
+            if not configuration_hash:
+                errors.append(f"{filename} is missing the SemT configuration hash")
+            if not image:
+                errors.append(f"{filename} is missing the SemT image reference")
+            elif image.endswith(":latest"):
+                errors.append(f"{filename} must not use a floating latest image tag")
+            if not _clean_string(artifact.get("build_manifest")):
+                errors.append(f"{filename} is missing the SemT image build manifest")
+            for required_file in (
+                "main.py",
+                "requirements.txt",
+                "node-manifest.json",
+            ):
+                if required_file not in build_context_files:
+                    errors.append(
+                        f"{filename} is missing required build artifact {required_file}"
+                    )
 
     missing = expected_ids - seen_ids
     for step_id in sorted(missing, key=_step_sort_key):
@@ -587,26 +717,238 @@ def _dependency_lookup(step_ids: Sequence[str], edges: Sequence[dict]) -> Dict[s
     return dependencies
 
 
+def _semt_secret_env(name: str, key: str) -> dict:
+    return {
+        "name": name,
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": "semt-runtime-credentials",
+                "key": key,
+            }
+        },
+    }
+
+
+def _build_semt_argo_workflow_object(
+    *,
+    steps: Sequence[dict],
+    ordered_ids: Sequence[str],
+    dependencies: Dict[str, List[str]],
+    dockerfiles_by_step: Dict[str, dict],
+    ingress_artifact: Optional[dict[str, str]] = None,
+) -> dict:
+    steps_by_id = {step["flow_id"]: step for step in steps}
+    child_lookup: Dict[str, List[str]] = {step_id: [] for step_id in ordered_ids}
+    for child, parents in dependencies.items():
+        for parent in parents:
+            child_lookup[parent].append(child)
+
+    tasks = []
+    entry_template = {
+        "name": "inlumen-pipeline",
+        "dag": {"tasks": tasks},
+    }
+    templates = [entry_template]
+    image_parameters = []
+
+    for step_id in ordered_ids:
+        task_name = _argo_name(step_id)
+        parent_ids = dependencies.get(step_id) or []
+        task = {
+            "name": task_name,
+            "template": task_name,
+            "arguments": {
+                "artifacts": [
+                    {
+                        "name": "table",
+                        **(
+                            {
+                                "from": f"{{{{tasks.{_argo_name(parent_ids[0])}."
+                                f"outputs.artifacts.table}}}}"
+                            }
+                            if parent_ids
+                            else {
+                                "s3": {
+                                    **(
+                                        ingress_artifact
+                                        if ingress_artifact
+                                        else {
+                                            "key": (
+                                                "{{workflow.parameters."
+                                                "input-artifact-key}}"
+                                            )
+                                        }
+                                    )
+                                }
+                            }
+                        ),
+                    }
+                ]
+            },
+        }
+        if parent_ids:
+            task["dependencies"] = [_argo_name(parent) for parent in parent_ids]
+        tasks.append(task)
+
+    leaf_id = next(step_id for step_id in ordered_ids if not child_lookup[step_id])
+    entry_template["outputs"] = {
+        "artifacts": [
+            {
+                "name": "result",
+                "from": f"{{{{tasks.{_argo_name(leaf_id)}.outputs.artifacts.table}}}}",
+            }
+        ]
+    }
+
+    for step_id in ordered_ids:
+        step = steps_by_id[step_id]
+        implementation = step.get("implementation") or {}
+        operation = str(implementation.get("operation") or "")
+        dockerfile = dockerfiles_by_step[step_id]
+        image_parameter = _argo_name(f"image-{step_id}", "image")
+        image_parameters.append(
+            {
+                "name": image_parameter,
+                "value": dockerfile["image"],
+            }
+        )
+
+        is_root = not dependencies.get(step_id)
+        is_leaf = step_id == leaf_id
+        input_path = "/data/input.csv" if is_root else "/data/input.json"
+        output_path = (
+            "/data/reconciled.json"
+            if operation == "reconciliation"
+            else "/data/output.json"
+        )
+        output_artifact = {
+            "name": "table",
+            "path": output_path,
+            "archive": {"none": {}},
+        }
+        if is_leaf:
+            output_artifact["s3"] = {
+                "key": "{{workflow.parameters.output-artifact-key}}"
+            }
+
+        command = dockerfile.get("command")
+        if not isinstance(command, list) or not all(
+            isinstance(item, str) for item in command
+        ):
+            command = _extract_json_cmd_from_dockerfile(
+                _clean_string(dockerfile.get("content"))
+            )
+        if not command:
+            command = ["python", "/app/main.py"]
+
+        env = [
+            {"name": "INLUMEN_FLOW_ID", "value": step_id},
+            {"name": "INLUMEN_INPUT_PATH", "value": input_path},
+            {"name": "INLUMEN_OUTPUT_PATH", "value": output_path},
+            {"name": "SEMT_API_BASE_URL", "value": "http://semt-backend:3003"},
+            _semt_secret_env("SEMT_API_USERNAME", "username"),
+            _semt_secret_env("SEMT_API_PASSWORD", "password"),
+        ]
+        templates.append(
+            {
+                "name": _argo_name(step_id),
+                "metadata": {
+                    "annotations": {
+                        "inlumen.ai/flow-id": step_id,
+                        "inlumen.ai/definition-id": step["definition_id"],
+                        "inlumen.ai/service-id": str(
+                            implementation.get("service_id") or ""
+                        ),
+                        "inlumen.ai/configuration-hash": dockerfile[
+                            "configuration_hash"
+                        ],
+                        "inlumen.ai/dockerfile": dockerfile[
+                            "dockerfile_filename"
+                        ],
+                    }
+                },
+                "inputs": {
+                    "artifacts": [
+                        {
+                            "name": "table",
+                            "path": input_path,
+                        }
+                    ]
+                },
+                "outputs": {"artifacts": [output_artifact]},
+                "container": {
+                    "image": f"{{{{workflow.parameters.{image_parameter}}}}}",
+                    "imagePullPolicy": "IfNotPresent",
+                    "workingDir": "/app",
+                    "command": command,
+                    "env": env,
+                },
+            }
+        )
+
+    return {
+        "apiVersion": "argoproj.io/v1alpha1",
+        "kind": "Workflow",
+        "metadata": {
+            "generateName": "inlumen-semt-",
+            "labels": {
+                "app.kubernetes.io/name": "inlumen-semt-workflow",
+                "app.kubernetes.io/component": "deployment-artifact",
+            },
+        },
+        "spec": {
+            "entrypoint": "inlumen-pipeline",
+            "artifactRepositoryRef": {
+                "configMap": "inlumen-artifact-repositories",
+                "key": "minio",
+            },
+            "arguments": {
+                "parameters": [
+                    {
+                        "name": "input-artifact-key",
+                        "value": "inlumen/input/input.csv",
+                    },
+                    {
+                        "name": "output-artifact-key",
+                        "value": "inlumen/output/output.json",
+                    },
+                    *image_parameters,
+                ],
+            },
+            "templates": templates,
+        },
+    }
+
+
 def build_argo_workflow_object(
     pipeline_graph: Optional[dict],
     dockerfiles_payload: Any,
     files: Any = None,
 ) -> dict:
-    steps = extract_pipeline_steps(pipeline_graph, files)
-    if not steps:
+    all_steps = extract_pipeline_steps(pipeline_graph, files)
+    if not all_steps:
         raise ValueError("No pipeline steps were found for Argo Workflow generation.")
 
+    edges = extract_pipeline_edges(pipeline_graph)
+    is_semt_workflow = any(
+        _clean_string(step.get("definition_id")).startswith("semt.")
+        for step in all_steps
+    )
+    steps = (
+        select_runtime_steps(all_steps)
+        if is_semt_workflow
+        else all_steps
+    )
     step_ids = [step["flow_id"] for step in steps]
     dockerfiles = _dockerfiles_from_payload(dockerfiles_payload)
     if not dockerfiles:
         raise ValueError("Dockerfile metadata is required for Argo Workflow generation.")
     validate_dockerfile_artifacts(dockerfiles, step_ids, steps)
 
-    edges = extract_pipeline_edges(pipeline_graph)
     explicit_edges = [
         edge for edge in edges if edge.get("source") in step_ids and edge.get("target") in step_ids
     ]
-    if not explicit_edges:
+    if not explicit_edges and not is_semt_workflow:
         ordered_ids = [step["flow_id"] for step in steps]
         explicit_edges = [
             {"source": ordered_ids[idx], "target": ordered_ids[idx + 1]}
@@ -617,6 +959,30 @@ def build_argo_workflow_object(
     steps_by_id = {step["flow_id"]: step for step in steps}
     dependencies = _dependency_lookup(step_ids, explicit_edges)
     dockerfiles_by_step = _dockerfile_lookup(dockerfiles)
+
+    if is_semt_workflow:
+        from semt.graph_validation import (
+            SemTGraphValidationError,
+            get_semt_ingress_artifact,
+            validate_semt_pipeline,
+        )
+
+        try:
+            validate_semt_pipeline(all_steps, edges, dockerfiles_by_step)
+        except SemTGraphValidationError as exc:
+            raise DeploymentArtifactValidationError(
+                "SemT graph contract validation failed",
+                exc.errors,
+            ) from exc
+        workflow = _build_semt_argo_workflow_object(
+            steps=steps,
+            ordered_ids=ordered_ids,
+            dependencies=dependencies,
+            dockerfiles_by_step=dockerfiles_by_step,
+            ingress_artifact=get_semt_ingress_artifact(all_steps, edges),
+        )
+        validate_argo_workflow_object(workflow, step_ids)
+        return workflow
 
     tasks = []
     templates = [
@@ -776,6 +1142,164 @@ def dump_yaml(data: dict) -> str:
     return "\n".join(_dump_yaml_lines(data)) + "\n"
 
 
+def _validate_semt_argo_contract(
+    spec: dict,
+    templates: Sequence[dict],
+    errors: List[str],
+) -> None:
+    repository_ref = spec.get("artifactRepositoryRef")
+    if repository_ref != {
+        "configMap": "inlumen-artifact-repositories",
+        "key": "minio",
+    }:
+        errors.append(
+            "SemT workflow must reference the inlumen-artifact-repositories/minio configuration."
+        )
+
+    arguments = spec.get("arguments")
+    arguments = arguments if isinstance(arguments, dict) else {}
+    parameters = arguments.get("parameters")
+    parameters = parameters if isinstance(parameters, list) else []
+    parameters_by_name = {
+        item.get("name"): item
+        for item in parameters
+        if isinstance(item, dict) and item.get("name")
+    }
+    for name in ("input-artifact-key", "output-artifact-key"):
+        if name not in parameters_by_name:
+            errors.append(f"SemT workflow is missing parameter {name!r}.")
+
+    entrypoint = spec.get("entrypoint")
+    template_by_name = {
+        template.get("name"): template
+        for template in templates
+        if isinstance(template, dict) and template.get("name")
+    }
+    entry_template = template_by_name.get(entrypoint) or {}
+    tasks = ((entry_template.get("dag") or {}).get("tasks") or [])
+    task_names = {
+        task.get("name")
+        for task in tasks
+        if isinstance(task, dict) and task.get("name")
+    }
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        artifact_arguments = ((task.get("arguments") or {}).get("artifacts") or [])
+        table_argument = next(
+            (
+                artifact
+                for artifact in artifact_arguments
+                if isinstance(artifact, dict) and artifact.get("name") == "table"
+            ),
+            None,
+        )
+        if not isinstance(table_argument, dict):
+            errors.append(
+                f"SemT task {task.get('name')!r} is missing its table artifact binding."
+            )
+            continue
+        source = str(table_argument.get("from") or "")
+        input_s3 = table_argument.get("s3") or {}
+        input_key = input_s3.get("key")
+        if input_key == "{{workflow.parameters.input-artifact-key}}":
+            continue
+        if input_s3.get("bucket") and input_key:
+            continue
+        if source:
+            match = re.fullmatch(
+                r"\{\{tasks\.([a-z0-9-]+)\.outputs\.artifacts\.table\}\}",
+                source,
+            )
+            if not match or match.group(1) not in task_names:
+                errors.append(
+                    f"SemT task {task.get('name')!r} has an invalid table artifact source."
+                )
+        else:
+            errors.append(
+                f"SemT task {task.get('name')!r} has an invalid table artifact source."
+            )
+
+    workflow_text = json.dumps(
+        {"spec": spec},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    for forbidden in ("localhost", "127.0.0.1", "host.docker.internal"):
+        if forbidden in workflow_text:
+            errors.append(f"SemT workflow contains host-local address {forbidden!r}.")
+
+    leaf_output_count = 0
+    for template in templates:
+        if not isinstance(template, dict) or not isinstance(
+            template.get("container"), dict
+        ):
+            continue
+        name = str(template.get("name") or "")
+        container = template["container"]
+        image = str(container.get("image") or "")
+        if image.endswith(":latest") or ":latest}}" in image:
+            errors.append(f"SemT template {name!r} uses a floating latest image tag.")
+        if not image.startswith("{{workflow.parameters.image-"):
+            errors.append(
+                f"SemT template {name!r} must use an immutable workflow image parameter."
+            )
+
+        env_by_name = {
+            item.get("name"): item
+            for item in (container.get("env") or [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        api_url = env_by_name.get("SEMT_API_BASE_URL") or {}
+        if api_url.get("value") != "http://semt-backend:3003":
+            errors.append(
+                f"SemT template {name!r} must use the internal semt-backend service."
+            )
+        for env_name, key in (
+            ("SEMT_API_USERNAME", "username"),
+            ("SEMT_API_PASSWORD", "password"),
+        ):
+            secret_ref = (
+                ((env_by_name.get(env_name) or {}).get("valueFrom") or {}).get(
+                    "secretKeyRef"
+                )
+                or {}
+            )
+            if secret_ref != {
+                "name": "semt-runtime-credentials",
+                "key": key,
+            }:
+                errors.append(
+                    f"SemT template {name!r} must read {env_name} from semt-runtime-credentials."
+                )
+
+        outputs = ((template.get("outputs") or {}).get("artifacts") or [])
+        table_output = next(
+            (
+                artifact
+                for artifact in outputs
+                if isinstance(artifact, dict) and artifact.get("name") == "table"
+            ),
+            None,
+        )
+        if not isinstance(table_output, dict):
+            errors.append(f"SemT template {name!r} is missing its table output.")
+            continue
+        if table_output.get("archive") != {"none": {}}:
+            errors.append(f"SemT template {name!r} must disable artifact archiving.")
+        if "s3" in table_output:
+            leaf_output_count += 1
+            if (table_output.get("s3") or {}).get("key") != (
+                "{{workflow.parameters.output-artifact-key}}"
+            ):
+                errors.append("SemT JSON output must use output-artifact-key.")
+
+    if leaf_output_count != 1:
+        errors.append("SemT workflow must have exactly one persisted JSON output artifact.")
+
+
 def validate_argo_workflow_object(workflow: Any, expected_step_ids: Optional[Iterable[str]] = None) -> None:
     errors: List[str] = []
     if not isinstance(workflow, dict):
@@ -869,6 +1393,17 @@ def validate_argo_workflow_object(workflow: Any, expected_step_ids: Optional[Ite
         if not (executable.get("command") or executable.get("source")):
             errors.append(f"template '{template_name}' is missing command/source")
 
+    is_semt_workflow = any(
+        isinstance(template, dict)
+        and any(
+            isinstance(env, dict) and env.get("name") == "SEMT_API_BASE_URL"
+            for env in ((template.get("container") or {}).get("env") or [])
+        )
+        for template in templates
+    )
+    if is_semt_workflow:
+        _validate_semt_argo_contract(spec, templates, errors)
+
     if errors:
         raise DeploymentArtifactValidationError("Argo Workflow guardrail validation failed", errors)
 
@@ -915,7 +1450,11 @@ def build_argo_workflow_yaml(
     files: Any = None,
 ) -> str:
     steps = extract_pipeline_steps(pipeline_graph, files)
+    runtime_steps = select_runtime_steps(steps)
     workflow = build_argo_workflow_object(pipeline_graph, dockerfiles_payload, files)
     yaml_text = dump_yaml(workflow)
-    validate_argo_workflow_yaml(yaml_text, [step["flow_id"] for step in steps])
+    validate_argo_workflow_yaml(
+        yaml_text,
+        [step["flow_id"] for step in runtime_steps],
+    )
     return yaml_text

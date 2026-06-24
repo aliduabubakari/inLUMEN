@@ -1,0 +1,47 @@
+{
+  "operation": "table_cpa",
+  "endpoint": "/tabular/cpa",
+  "request": {
+    "table_id": "books",
+    "sampled_rows": [
+      {
+        "book": "The Left Hand of Darkness",
+        "author": "Ursula K. Le Guin"
+      }
+    ],
+    "subject_column": "book",
+    "subject_class": "schema:Book",
+    "target_columns": [
+      "author"
+    ],
+    "use_sti_signature_cache": true,
+    "debug": false,
+    "debug_preview_limit": 20,
+    "schema": "schemaorg_cpa_v1",
+    "llm": {
+      "provider": "openrouter",
+      "model": "anthropic/claude-3.5-sonnet"
+    }
+  },
+  "queued_response": {
+    "job_id": "33333333333333333333333333333333",
+    "status": "queued"
+  },
+  "completed_job": {
+    "job_id": "33333333333333333333333333333333",
+    "status": "completed",
+    "created_at": "2026-04-13T14:02:00+00:00",
+    "updated_at": "2026-04-13T14:02:01+00:00",
+    "result": {
+      "table_id": "books",
+      "subject_column": "book",
+      "relationships": [
+        {
+          "target_column": "author",
+          "relation_id": "schema:author",
+          "confidence": 0.93
+        }
+      ]
+    }
+  }
+}

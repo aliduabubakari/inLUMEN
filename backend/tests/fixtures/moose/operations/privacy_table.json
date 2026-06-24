@@ -1,0 +1,104 @@
+{
+  "operation": "privacy_table",
+  "endpoint": "/privacy/analyze",
+  "request": {
+    "profile": "fast",
+    "tasks": [
+      {
+        "kind": "table",
+        "task_id": "privacy-table-1",
+        "table_id": "customers",
+        "sampled_rows": [
+          {
+            "name": "Alice",
+            "email": "alice@example.com"
+          }
+        ],
+        "scan_columns": [
+          "name",
+          "email"
+        ]
+      }
+    ],
+    "llm": {
+      "provider": "openrouter",
+      "model": "anthropic/claude-3.5-sonnet"
+    }
+  },
+  "queued_response": {
+    "job_id": "55555555555555555555555555555555",
+    "status": "queued"
+  },
+  "completed_job": {
+    "job_id": "55555555555555555555555555555555",
+    "status": "completed",
+    "created_at": "2026-04-13T14:04:00+00:00",
+    "updated_at": "2026-04-13T14:04:01+00:00",
+    "result": {
+      "profile": "fast",
+      "policy_pack": "gdpr_basic",
+      "action_catalog": [],
+      "results": [
+        {
+          "task_id": "privacy-table-1",
+          "kind": "table",
+          "policy_pack": "gdpr_basic",
+          "findings": [],
+          "extraction": {
+            "task_id": "privacy-table-1",
+            "table_id": "customers",
+            "columns": [
+              {
+                "column": "name",
+                "type_id": "dpv-pd:Identifying",
+                "confidence": 0.96
+              },
+              {
+                "column": "email",
+                "type_id": "dpv-pd:Contact",
+                "confidence": 0.99
+              }
+            ]
+          }
+        }
+      ],
+      "reports": {
+        "human_readable": {
+          "format": "markdown",
+          "content": "# Privacy Analysis Report\n"
+        },
+        "machine_readable": {
+          "schema_id": "moose.privacy.machine_report.v1",
+          "schema_version": "1.0.0",
+          "content": {
+            "report_type": "privacy_analysis",
+            "schema_id": "moose.privacy.machine_report.v1",
+            "schema_version": "1.0.0",
+            "generated_at": "2026-04-13T14:04:01+00:00",
+            "profile": "fast",
+            "policy_pack": "gdpr_basic",
+            "summary": {
+              "task_count": 1,
+              "finding_count": 0,
+              "severity_counts": {},
+              "status_counts": {},
+              "assessment_counts": {},
+              "action_counts": {}
+            },
+            "tasks": [
+              {
+                "task_id": "privacy-table-1",
+                "kind": "table",
+                "table_id": null,
+                "finding_count": 0,
+                "findings": []
+              }
+            ],
+            "warnings": [],
+            "escalations": []
+          }
+        }
+      }
+    }
+  }
+}

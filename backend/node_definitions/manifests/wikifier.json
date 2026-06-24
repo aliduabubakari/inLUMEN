@@ -1,0 +1,37 @@
+{
+  "definitions": [
+    {
+      "id": "wikifier.annotation",
+      "version": 1,
+      "base_type": "action",
+      "family": "wikifier",
+      "operation": "annotation",
+      "palette": {
+        "label": "JSI Wikifier",
+        "description": "Annotate text with Wikipedia concepts using JSI Wikifier",
+        "icon": "tags",
+        "color": "emerald",
+        "order": 240
+      },
+      "editor": {
+        "kind": "wikifier",
+        "catalog": "annotation"
+      },
+      "runtime": {
+        "generator": "wikifier",
+        "base_image": "python:3.11-slim"
+      },
+      "default_implementation": {
+        "kind": "wikifier",
+        "operation": "annotation",
+        "parameters": {
+          "source_column": "",
+          "language": "en",
+          "threshold": 0.8,
+          "output_mode": "compact_and_raw"
+        },
+        "connection_ref": "default-wikifier"
+      }
+    }
+  ]
+}

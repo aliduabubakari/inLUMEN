@@ -22,7 +22,7 @@ RUN find . \( -name "*.sh" -o -name "*.py" \) -exec sed -i 's/\r$//' {} +
 # RUN pip3 install -r requirements.txt
 
 # Expose the backend gateway API.
-EXPOSE 5000
+EXPOSE 5001
 
 # Give execute permission to shell scripts
 RUN chmod +x run_inlumen.sh

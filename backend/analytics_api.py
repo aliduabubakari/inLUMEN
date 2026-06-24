@@ -36,6 +36,25 @@ def _preflight_response():
     return make_response("", 200)
 
 
+def _optional_llm_config_from_payload(data: dict):
+    raw_config = data.get("llm_config")
+    has_top_level_config = any(
+        key in data
+        for key in (
+            "provider",
+            "llm_provider",
+            "model",
+            "base_url",
+            "baseUrl",
+            "api_key",
+            "apiKey",
+        )
+    )
+    if isinstance(raw_config, dict) or has_top_level_config:
+        return llm_config_from_payload(data)
+    return None
+
+
 def _dockerfile_inputs(files: list[dict]) -> tuple[list[str], list[str], list[str]]:
     filenames = [file["filename"] for file in files]
     buckets = [file["bucket"] for file in files]
@@ -398,9 +417,10 @@ def agentic_generate_dockerfiles():
         print("[analytics_api.py] Buckets received:", buckets)
         print("[analytics_api.py] Corresponding IDs to filenames that were received:", ids)
 
-        llm_config = llm_config_from_payload(data)
-        log_llm_selection("Generating Dockerfiles from pipeline context", llm_config)
-        print("[analytics_api.py] Generating Dockerfiles with LLM artifact generator.")
+        llm_config = _optional_llm_config_from_payload(data)
+        if llm_config is not None:
+            log_llm_selection("Generating Dockerfiles from pipeline context", llm_config)
+        print("[analytics_api.py] Generating Dockerfiles from registered generators and generic fallback.")
         pipeline_graph = _pipeline_graph_from_payload_or_backend(data)
         parsed = run_async(
             generate_dockerfiles_with_agent(
@@ -453,8 +473,9 @@ def agentic_generate_version_yamls():
     data = request.get_json(silent=True) or {}
 
     try:
-        llm_config = llm_config_from_payload(data)
-        log_llm_selection("Generating Dockerfiles for all pipeline versions", llm_config)
+        llm_config = _optional_llm_config_from_payload(data)
+        if llm_config is not None:
+            log_llm_selection("Generating Dockerfiles for all pipeline versions", llm_config)
         versions = run_async(fetch_pipeline_versions(
             include_graph=True,
             authorization=_request_authorization_header(),

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "kind": "inlumen.text",
+  "contract_version": "1",
+  "text": "Maria works at Acme in Oslo.",
+  "metadata": {
+    "source": "phase-m0-fixture"
+  },
+  "extensions": {
+    "moose": [
+      {
+        "schema_version": 1,
+        "flow_id": "moose-text-1",
+        "operation": "text_ner",
+        "schema": "coarse",
+        "result": {
+          "entities": [
+            {
+              "start": 0,
+              "end": 5,
+              "text": "Maria",
+              "type_id": "PERSON",
+              "confidence": 0.98
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -1,6 +1,6 @@
 const browserHost = window.location.hostname || "localhost";
 
-const inlumenApiPort = (import.meta.env.VITE_INLUMEN_API_PORT as string) || "5000";
+const inlumenApiPort = (import.meta.env.VITE_INLUMEN_API_PORT as string) || "5001";
 
 const normalizeApiUrl = (url: string): string => {
   const trimmedUrl = url.trim().replace(/\/$/, "");

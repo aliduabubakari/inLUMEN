@@ -1,0 +1,45 @@
+{
+  "operation": "table_annotation",
+  "endpoint": "/tabular/annotate",
+  "request": {
+    "table_id": "customers",
+    "sampled_rows": [
+      {
+        "name": "Alice",
+        "email": "alice@example.com"
+      }
+    ],
+    "schema": "sti",
+    "llm": {
+      "provider": "openrouter",
+      "model": "anthropic/claude-3.5-sonnet"
+    }
+  },
+  "queued_response": {
+    "job_id": "22222222222222222222222222222222",
+    "status": "queued"
+  },
+  "completed_job": {
+    "job_id": "22222222222222222222222222222222",
+    "status": "completed",
+    "created_at": "2026-04-13T14:01:00+00:00",
+    "updated_at": "2026-04-13T14:01:01+00:00",
+    "result": {
+      "table_id": "customers",
+      "columns": [
+        {
+          "column": "name",
+          "type_id": "NE:PERSON",
+          "confidence": 0.95,
+          "fine_type_id": "PERSON",
+          "fine_confidence": 0.93
+        },
+        {
+          "column": "email",
+          "type_id": "NE:EMAIL",
+          "confidence": 0.99
+        }
+      ]
+    }
+  }
+}

@@ -15,20 +15,28 @@ from analytics_api import (
     agentic_pipeline_editor_reset,
 )
 from auth_middleware import require_auth
+from generators.routes import create_generator_blueprint
 from graph_client import dispatch_graph_request
 from local_api_client import LocalApiResponse
+from moose import create_moose_blueprint
+from node_definitions import create_node_definitions_blueprint
 from object_client import dispatch_object_request
 from public_api import create_public_api_blueprint
 from runtime_config import add_cors_headers, get_service_port
+from semt import create_semt_blueprint
 
 
-INLUMEN_API_PORT = get_service_port("INLUMEN_API_PORT", 5000)
+INLUMEN_API_PORT = get_service_port("INLUMEN_API_PORT", 5001)
 CHATBOT_CONFIGS_PATH = Path(
     os.getenv("CHATBOT_CONFIGS_PATH", "state/chatbot_configurations.json")
 )
 
 app = Flask(__name__)
 app.register_blueprint(create_public_api_blueprint())
+app.register_blueprint(create_node_definitions_blueprint())
+app.register_blueprint(create_semt_blueprint())
+app.register_blueprint(create_moose_blueprint())
+app.register_blueprint(create_generator_blueprint())
 app.add_url_rule(
     "/agentic_generate_dockerfiles",
     endpoint="agentic_generate_dockerfiles",

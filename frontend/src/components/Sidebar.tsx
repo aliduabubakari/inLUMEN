@@ -13,25 +13,28 @@ import {
   updatePipelineOverviewMetadata,
 } from '@/features/flow/flowPersistence';
 import {
-  Brain,
-  MessageCircle,
-  FileText,
-  Zap,
-  Settings,
-  Clipboard,
-  Database,
   Plus,
-  Info,
   LayoutGrid,
   Beaker,
   PlayCircle,
-  PlusCircle,
   BarChart3,
   Calendar,
+  FileText,
   Hash,
   Paperclip,
   Download
 } from 'lucide-react';
+import {
+  createNodeDataFromDefinition,
+  fetchNodeDefinitions,
+  getFallbackNodeDefinitions,
+  groupNodeDefinitions,
+} from '@/features/nodes/registry/nodeRegistry';
+import {
+  getNodeDefinitionColorClasses,
+  getNodeDefinitionIcon,
+} from '@/features/nodes/registry/iconRegistry';
+import type { NodeDefinition } from '@/features/nodes/registry/types';
 
 interface PipelineOverview {
   version: string;
@@ -63,21 +66,9 @@ interface SidebarProps {
   activeChatbotConfig?: ChatbotConfig;
 }
 
-interface NodeTypeItem {
-  type: string;
-  label: string;
-  description: string;
-  icon: React.ReactNode;
-  color: string;
-}
-
 type DragNodeType = {
   type: string;
-  data: {
-    label: string;
-    description: string;
-    type: string;
-  };
+  data: ReturnType<typeof createNodeDataFromDefinition>;
 };
 
 type BackendFileRef = {
@@ -90,6 +81,14 @@ type DockerfileGenerationResponse = {
   dockerfiles?: Array<{
     dockerfile_filename?: string;
     content?: string;
+  }>;
+  runtime_artifacts?: Array<{
+    flow_id?: string;
+    files?: Array<{
+      filename?: string;
+      content?: string;
+      content_type?: string;
+    }>;
   }>;
 };
 
@@ -104,81 +103,16 @@ type PipelineOverviewResponse = {
 const errorToMessage = (error: unknown, fallback: string) =>
   error instanceof Error ? error.message : fallback;
 
-const nodeTypes: NodeTypeItem[] = [
-  {
-    type: 'config',
-    label: 'Model Configuration',
-    description: 'Adjust model parameters, system prompt and more',
-    icon: <Settings className="w-4 h-4" />,
-    color: 'bg-sky-500/20 text-sky-300 border-sky-500/30'
-  },
-  {
-    type: 'input',
-    label: 'Input Data',
-    description: 'Raw data from sensors, APIs, files or user message.',
-    icon: <Database className="w-4 h-4" />,
-    color: 'bg-blue-500/20 text-blue-300 border-blue-500/30'
-  },
-  {
-    type: 'action',
-    label: 'Data Preprocessing',
-    description: 'Clean, normalize, and transform input data',
-    icon: <FileText className="w-4 h-4" />,
-    color: 'bg-lime-500/20 text-lime-300 border-lime-500/30'
-  },
-  {
-    type: 'action',
-    label: 'Feature Engineering',
-    description: 'Generate or select features for model input',
-    icon: <Info className="w-4 h-4" />,
-    color: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/30'
-  },
-  {
-    type: 'action',
-    label: 'Model Training',
-    description: 'Train machine learning or deep learning models',
-    icon: <Brain className="w-4 h-4" />,
-    color: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
-  },
-  {
-    type: 'action',
-    label: 'Model Evaluation',
-    description: 'Assess model performance and metrics',
-    icon: <Zap className="w-4 h-4" />,
-    color: 'bg-purple-500/20 text-purple-300 border-purple-500/30'
-  },
-  {
-    type: 'output',
-    label: 'AI/ML Output',
-    description: 'AI/ML pipeline results',
-    icon: <MessageCircle className="w-4 h-4" />,
-    color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
-  },
-  {
-    type: 'api',
-    label: 'API Call',
-    description: 'Connect to external services',
-    icon: <Database className="w-4 h-4" />,
-    color: 'bg-rose-500/20 text-rose-300 border-rose-500/30'
-  },
-  {
-    type: 'storage',
-    label: 'Clipboard',
-    description: 'Store and retrieve content',
-    icon: <Clipboard className="w-4 h-4" />,
-    color: 'bg-teal-500/20 text-teal-300 border-teal-500/30'
-  },
-  {
-    type: 'custom',
-    label: 'Custom Node',
-    description: 'Add custom label and description',
-    icon: <PlusCircle className="w-4 h-4" />,
-    color: 'bg-violet-500/20 text-violet-300 border-violet-500/30'
-  }
-];
-
 type DockerfileDownload = { name: string; url: string };
+type RuntimeArtifactDownload = { name: string; url: string };
 type YamlDownload = { name: string; url: string };
+
+const FAMILY_LABELS: Record<string, string> = {
+  core: "Core",
+  semt: "SemT",
+  moose: "Moose",
+  wikifier: "Wikifier",
+};
 
 export function Sidebar({
   className,
@@ -204,8 +138,31 @@ export function Sidebar({
   // --- Dockerfiles state
   const [isGeneratingDeployment, setIsGeneratingDeployment] = useState(false);
   const [dockerfileDownloads, setDockerfileDownloads] = useState<DockerfileDownload[]>([]);
+  const [runtimeArtifactDownloads, setRuntimeArtifactDownloads] = useState<RuntimeArtifactDownload[]>([]);
   const [yamlDownload, setYamlDownload] = useState<YamlDownload | null>(null);
   const [deploymentError, setDeploymentError] = useState<string>("");
+  const [nodeDefinitions, setNodeDefinitions] = useState<NodeDefinition[]>(
+    getFallbackNodeDefinitions,
+  );
+  const [nodeDefinitionsError, setNodeDefinitionsError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchNodeDefinitions()
+      .then((definitions) => {
+        if (cancelled) return;
+        setNodeDefinitions(definitions);
+        setNodeDefinitionsError("");
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.warn("[Sidebar.tsx] Using fallback node definitions:", error);
+        setNodeDefinitionsError("Backend node definitions unavailable; showing core nodes.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Cleanup blob URLs on unmount
   useEffect(() => {
@@ -219,6 +176,13 @@ export function Sidebar({
   const clearDockerfileDownloads = () => {
     setDockerfileDownloads((prev) => {
       prev.forEach((d) => URL.revokeObjectURL(d.url));
+      return [];
+    });
+  };
+
+  const clearRuntimeArtifactDownloads = () => {
+    setRuntimeArtifactDownloads((prev) => {
+      prev.forEach((download) => URL.revokeObjectURL(download.url));
       return [];
     });
   };
@@ -307,6 +271,7 @@ export function Sidebar({
       setDeploymentError("");
       setIsGeneratingDeployment(true);
       clearDockerfileDownloads();
+      clearRuntimeArtifactDownloads();
       clearYamlDownload();
 
       const files = await fetchBackendFiles();
@@ -326,7 +291,19 @@ export function Sidebar({
         }
       );
 
-      setDockerfileDownloads(links);
+      const runtimeLinks = (dockerfile_json.runtime_artifacts ?? []).flatMap((artifact) =>
+        (artifact.files ?? [])
+          .filter((file) => file.filename && !file.filename.startsWith("Dockerfile."))
+          .map((file) => {
+            const blob = new Blob([file.content ?? ""], {
+              type: file.content_type || "text/plain;charset=utf-8",
+            });
+            return {
+              name: `${artifact.flow_id ?? "semt"}-${file.filename}`,
+              url: URL.createObjectURL(blob),
+            };
+          }),
+      );
 
       const yamlRes = await apiFetch(`${INLUMEN_API_URL}/agentic_generate_yaml`, {
         method: "POST",
@@ -346,8 +323,12 @@ export function Sidebar({
       const blob = new Blob([yamlText], { type: "application/x-yaml;charset=utf-8" });
       const url = URL.createObjectURL(blob);
 
+      setDockerfileDownloads(links);
+      setRuntimeArtifactDownloads(runtimeLinks);
       setYamlDownload({ name: `ai-pipeline-${Date.now()}.yaml`, url });
     } catch (e: unknown) {
+      clearDockerfileDownloads();
+      clearRuntimeArtifactDownloads();
       console.error("[Sidebar.tsx] Generate deployment artifacts error:", e);
       setDeploymentError(errorToMessage(e, "Failed to generate deployment artifacts."));
     } finally {
@@ -440,30 +421,41 @@ export function Sidebar({
                 <Plus className="w-4 h-4" />
                 Node Types
               </h3>
-              <div className="space-y-2">
-                {nodeTypes.map((nodeType) => (
-                  <div
-                    key={nodeType.label}
-                    draggable
-                    onDragStart={(event) =>
-                      onDragStart(event, {
-                        type: 'custom',
-                        data: {
-                          label: nodeType.label,
-                          description: nodeType.description,
-                          type: nodeType.type
-                        }
-                      })
-                    }
-                    className="flex items-start gap-3 p-2.5 rounded-md border border-border cursor-move hover:bg-muted/50 transition-colors"
-                  >
-                    <div className={cn("p-1.5 rounded-md", nodeType.color.split(' ')[0])}>
-                      {nodeType.icon}
-                    </div>
-                    <div>
-                      <h4 className="text-sm font-medium">{nodeType.label}</h4>
-                      <p className="text-xs text-muted-foreground mt-0.5">{nodeType.description}</p>
-                    </div>
+              {nodeDefinitionsError && (
+                <p className="text-xs text-amber-400 mb-3">{nodeDefinitionsError}</p>
+              )}
+              <div className="space-y-5">
+                {groupNodeDefinitions(nodeDefinitions).map(([family, definitions]) => (
+                  <div key={family} className="space-y-2">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      {FAMILY_LABELS[family] ?? family}
+                    </p>
+                    {definitions.map((definition) => {
+                      const colorClasses = getNodeDefinitionColorClasses(definition.palette.color);
+                      return (
+                        <div
+                          key={definition.id}
+                          draggable
+                          onDragStart={(event) =>
+                            onDragStart(event, {
+                              type: 'custom',
+                              data: createNodeDataFromDefinition(definition),
+                            })
+                          }
+                          className="flex items-start gap-3 p-2.5 rounded-md border border-border cursor-move hover:bg-muted/50 transition-colors"
+                        >
+                          <div className={cn("p-1.5 rounded-md", colorClasses.split(' ')[0])}>
+                            {getNodeDefinitionIcon(definition.palette.icon)}
+                          </div>
+                          <div>
+                            <h4 className="text-sm font-medium">{definition.palette.label}</h4>
+                            <p className="text-xs text-muted-foreground mt-0.5">
+                              {definition.palette.description}
+                            </p>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 ))}
               </div>
@@ -572,7 +564,7 @@ export function Sidebar({
             <div className="p-4 border rounded-lg border-border">
               <h3 className="text-sm font-medium mb-2">Generate Deployment Artifacts</h3>
               <p className="text-xs text-muted-foreground mb-3">
-                Produces the Dockerfiles for each step and then builds the Argo Workflow YAML using those artifacts.
+                Generates SemT runtime files and Dockerfiles, then builds the Argo Workflow YAML.
               </p>
 
               <Button
@@ -612,6 +604,33 @@ export function Sidebar({
                     onClick={clearDockerfileDownloads}
                   >
                     Clear Dockerfile Links
+                  </Button>
+                </div>
+              )}
+
+              {runtimeArtifactDownloads.length > 0 && (
+                <div className="mt-4">
+                  <div className="text-xs font-medium mb-2">SemT Runtime Downloads</div>
+                  <div className="space-y-1">
+                    {runtimeArtifactDownloads.map((download) => (
+                      <a
+                        key={download.url}
+                        href={download.url}
+                        download={download.name}
+                        className="flex items-center gap-2 text-xs underline"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span className="truncate">{download.name}</span>
+                      </a>
+                    ))}
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="mt-3 w-full"
+                    onClick={clearRuntimeArtifactDownloads}
+                  >
+                    Clear SemT Runtime Links
                   </Button>
                 </div>
               )}

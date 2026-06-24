@@ -6,10 +6,11 @@ networks:
 
 volumes:
   frontend_node_modules:
+  neo4j_data:
 
 services:
   neo4j:
-    image: neo4j:5-community
+    image: neo4j:5.26.27-community
     container_name: datapact_neo4j_db
     hostname: datapact-neo4j-db
     mem_limit: 4G
@@ -18,7 +19,7 @@ services:
       - "${NEO4J_HTTP_PORT:-7474}:7474"
       - "${NEO4J_BOLT_PORT:-7687}:7687"
     volumes:
-      - ./neo4j_data_volume:/data
+      - neo4j_data:/data
       - ./neo4j_logs_volume:/logs
       - ./neo4j_import_volume:/import
       - ./neo4j_plugins_volume:/plugins
@@ -68,13 +69,22 @@ services:
         condition: service_started
     working_dir: /usr/inlumen
     ports:
-      - "${INLUMEN_API_PORT:-5000}:${INLUMEN_API_PORT:-5000}"
+      - "${INLUMEN_API_PORT:-5001}:${INLUMEN_API_PORT:-5001}"
     volumes:
       - ./backend:/usr/inlumen
     environment:
       PYTHONUNBUFFERED: "1"
       FRONTEND_PORT: ${FRONTEND_PORT:-8080}
-      INLUMEN_API_PORT: ${INLUMEN_API_PORT:-5000}
+      INLUMEN_API_PORT: ${INLUMEN_API_PORT:-5001}
+      SEMT_API_BASE_URL: ${SEMT_API_BASE_URL:-}
+      SEMT_API_TOKEN: ${SEMT_API_TOKEN:-}
+      SEMT_CATALOG_TIMEOUT_SECONDS: ${SEMT_CATALOG_TIMEOUT_SECONDS:-5}
+      SEMT_CATALOG_CACHE_TTL_SECONDS: ${SEMT_CATALOG_CACHE_TTL_SECONDS:-300}
+      MOOSE_API_BASE_URL: ${MOOSE_API_BASE_URL:-}
+      MOOSE_API_KEY: ${MOOSE_API_KEY:-}
+      MOOSE_API_TIMEOUT_SECONDS: ${MOOSE_API_TIMEOUT_SECONDS:-5}
+      MOOSE_CATALOG_CACHE_TTL_SECONDS: ${MOOSE_CATALOG_CACHE_TTL_SECONDS:-300}
+      INLUMEN_IMAGE_REGISTRY: ${INLUMEN_IMAGE_REGISTRY:-ghcr.io}
       NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/password}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio-datapact}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio-datapact}
@@ -92,7 +102,7 @@ services:
         - CMD
         - python
         - -c
-        - "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"INLUMEN_API_PORT\", \"5000\")}/health', timeout=5)"
+        - "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"INLUMEN_API_PORT\", \"5001\")}/health', timeout=5)"
       interval: 5s
       timeout: 5s
       retries: 12
@@ -116,7 +126,7 @@ services:
     environment:
       FRONTEND_PORT: ${FRONTEND_PORT:-8080}
       NODE_ENV: development
-      VITE_INLUMEN_API_PORT: ${INLUMEN_API_PORT:-5000}
+      VITE_INLUMEN_API_PORT: ${INLUMEN_API_PORT:-5001}
       VITE_INLUMEN_API_URL: ${VITE_INLUMEN_API_URL:-${INLUMEN_API_PUBLIC_URL:-}}
       VITE_AUTH_ENABLED: ${VITE_AUTH_ENABLED:-${AUTH_ENABLED:-false}}
       VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-http://localhost:8081}

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inlumen-artifact-repositories
+data:
+  minio: |
+    archiveLogs: false
+    s3:
+      bucket: inlumen-argo-artifacts
+      endpoint: minio:9000
+      insecure: true
+      accessKeySecret:
+        name: minio-artifact-credentials
+        key: accesskey
+      secretKeySecret:
+        name: minio-artifact-credentials
+        key: secretkey
