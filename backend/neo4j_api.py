@@ -239,6 +239,8 @@ def _sync_graph_to_session(
 ) -> dict:
     nodes, edges = _parse_visible_graph(graph)
     pipeline_uid = _ensure_design_pipeline(session)
+    settings = graph.get("settings") if isinstance(graph.get("settings"), dict) else {}
+    settings_json = json.dumps(settings, ensure_ascii=False)
 
     if not nodes:
         deleted_ids = _clear_active_steps(session)
@@ -254,6 +256,7 @@ def _sync_graph_to_session(
             WHEN $active_version_uid IS NULL THEN p.active_version_uid
             ELSE $active_version_uid
           END
+        SET p.settings_json = $settings_json
         SET p.description = CASE
             WHEN $active_version_uid IS NULL THEN p.description
             ELSE coalesce(activeVersion.description, p.description, '')
@@ -262,7 +265,8 @@ def _sync_graph_to_session(
         """, pipeline_uid=pipeline_uid,
              version_name=version_name,
              active_version_uid=active_version_uid,
-             touch_pipeline_updated_at=touch_pipeline_updated_at).single()
+             touch_pipeline_updated_at=touch_pipeline_updated_at,
+             settings_json=settings_json).single()
         return {
             "ok": True,
             "pipeline_uid": pipeline_uid,
@@ -351,6 +355,7 @@ def _sync_graph_to_session(
         WHEN $active_version_uid IS NULL THEN p.active_version_uid
         ELSE $active_version_uid
       END
+    SET p.settings_json = $settings_json
     SET p.description = CASE
         WHEN $active_version_uid IS NULL THEN p.description
         ELSE coalesce(activeVersion.description, p.description, '')
@@ -359,7 +364,8 @@ def _sync_graph_to_session(
     """, pipeline_uid=pipeline_uid,
          version_name=version_name,
          active_version_uid=active_version_uid,
-         touch_pipeline_updated_at=touch_pipeline_updated_at).single()
+         touch_pipeline_updated_at=touch_pipeline_updated_at,
+         settings_json=settings_json).single()
 
     return {
         "ok": True,
@@ -1854,6 +1860,7 @@ def neo4j_get_graph():
         .description,
         .version,
         .active_version_uid,
+        .settings_json,
         .status,
         created_at: toString(p.created_at),
         updated_at: toString(p.updated_at)
@@ -1890,7 +1897,15 @@ def neo4j_get_graph():
 
             updated_at = record["updated_at"]
             pipeline = record["pipeline"] or {}
+            settings = {}
             if isinstance(pipeline, dict):
+                settings_json = pipeline.get("settings_json")
+                if isinstance(settings_json, str) and settings_json.strip():
+                    try:
+                        parsed_settings = json.loads(settings_json)
+                        settings = parsed_settings if isinstance(parsed_settings, dict) else {}
+                    except Exception:
+                        settings = {}
                 pipeline["design_pipeline_count"] = record["design_pipeline_count"]
                 pipeline["step_count"] = record["pipeline_step_count"]
                 active_version_uid = pipeline.get("active_version_uid")
@@ -1992,6 +2007,7 @@ def neo4j_get_graph():
             return jsonify({
                 "updated_at": updated_at,
                 "pipeline": pipeline,
+                "settings": settings,
                 "nodes": nodes,
                 "edges": edges,
                 "viewport": {"x": 0, "y": 0, "zoom": 1}

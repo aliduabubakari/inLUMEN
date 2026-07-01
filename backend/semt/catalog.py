@@ -836,6 +836,9 @@ EXTENSION_ITEMS = (
                 required=True,
                 min_items=1,
                 options=(
+                    ("light_hours", "Light Hours"),
+                    ("apparent_temperature_max", "Apparent Max Temperature"),
+                    ("apparent_temperature_min", "Apparent Min Temperature"),
                     ("temperature_2m_max", "Max Temperature"),
                     ("temperature_2m_min", "Min Temperature"),
                     ("precipitation_sum", "Precipitation"),

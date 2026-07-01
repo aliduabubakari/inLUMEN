@@ -27,6 +27,100 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _normalise_api_base_url(value: Any) -> str:
+    url = str(value or "").strip().rstrip("/")
+    if url.endswith("/api"):
+        return url[:-4].rstrip("/")
+    return url
+
+
+def _semt_settings_parameters(graph: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(graph, dict):
+        return {}
+    settings = graph.get("settings")
+    if not isinstance(settings, dict):
+        return {}
+    semt = settings.get("semt")
+    if not isinstance(semt, dict):
+        return {}
+
+    parameters: dict[str, Any] = {}
+    api_base_url = (
+        _normalise_api_base_url(semt.get("api_base_url"))
+        or _normalise_api_base_url(semt.get("base_url"))
+        or _normalise_api_base_url(semt.get("api_url"))
+    )
+    if api_base_url:
+        parameters["api_base_url"] = api_base_url
+
+    for key in ("username", "password", "token"):
+        value = semt.get(key)
+        if value not in (None, ""):
+            parameters[key] = value
+    return parameters
+
+
+def _node_data(node: dict[str, Any]) -> dict[str, Any]:
+    data = node.get("data")
+    return data if isinstance(data, dict) else node
+
+
+def _semt_table_load_parameters(graph: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(graph, dict):
+        return {}
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, list):
+        return {}
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        data = _node_data(node)
+        if str(data.get("definition_id") or "") != "core.input-data":
+            continue
+        implementation = data.get("implementation")
+        if not isinstance(implementation, dict):
+            continue
+        if str(implementation.get("kind") or "") != "semt-input":
+            continue
+        parameters = implementation.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        if parameters.get("semt_table_load") is not True:
+            continue
+
+        table_load_parameters: dict[str, Any] = {"semt_table_load": True}
+        for key in ("dataset_id", "table_name", "csv_file"):
+            value = parameters.get(key)
+            if value not in (None, ""):
+                table_load_parameters[key] = value
+        return table_load_parameters
+    return {}
+
+
+def _implementation_with_graph_settings(
+    implementation: dict[str, Any],
+    graph: dict[str, Any] | None,
+) -> dict[str, Any]:
+    global_parameters = _semt_settings_parameters(graph)
+    table_load_parameters = _semt_table_load_parameters(graph)
+    if not global_parameters and not table_load_parameters:
+        return implementation
+
+    current_parameters = implementation.get("parameters")
+    if not isinstance(current_parameters, dict):
+        current_parameters = {}
+
+    return {
+        **implementation,
+        "parameters": {
+            **global_parameters,
+            **table_load_parameters,
+            **current_parameters,
+        },
+    }
+
+
 class SemTGenerator:
     name = "semt"
     version = GENERATOR_VERSION
@@ -47,7 +141,6 @@ class SemTGenerator:
         step: dict[str, Any],
         graph: dict[str, Any] | None = None,
     ) -> GeneratedRuntimeArtifacts:
-        del graph
         flow_id = str(step.get("flow_id") or "").strip()
         definition_id = str(step.get("definition_id") or "").strip()
         if not flow_id:
@@ -68,6 +161,7 @@ class SemTGenerator:
         implementation = step.get("implementation")
         if not isinstance(implementation, dict):
             implementation = {}
+        implementation = _implementation_with_graph_settings(implementation, graph)
         validation = get_semt_catalog_service().validate_implementation(
             definition_id,
             implementation,

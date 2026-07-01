@@ -3,12 +3,15 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import { PlusCircle, Upload, X, Eye } from 'lucide-react';
+import { Loader2, PlusCircle, Upload, Wand2, X, Eye } from 'lucide-react';
+import { toast } from "sonner";
 import { FilePreviewDialog, PreviewType } from '@/components/properties/FilePreviewDialog';
 import { NodeDefinitionEditor } from '@/components/properties/editors/NodeDefinitionEditor';
 import { getTypeColor, getTypeIcon } from '@/components/properties/nodeAppearance';
+import { ChatbotConfig, buildCodegenLLMRequestConfig } from '@/services/chatbotService';
 import {
   normalizeType,
   pickBackendUpdatableProps,
@@ -31,6 +34,7 @@ import {
 import {
   readNodeFile,
   removeNodeFile,
+  generateNodeScript,
   updateNodeTextFile,
   updateNodePropertiesInBackend,
   uploadNodeFile,
@@ -38,6 +42,18 @@ import {
 import { Node } from 'reactflow';
 
 type NodeParamMap = Record<string, string>;
+
+type SemTInputImplementation = {
+  kind: "semt-input";
+  mode: "table-load";
+  parameters: {
+    dataset_id?: string;
+    table_name?: string;
+    csv_file?: string;
+    semt_table_load?: boolean;
+  };
+  connection_ref: string;
+};
 
 export type PropertyNodeData = {
   label?: string;
@@ -69,18 +85,55 @@ const uploadedFileReference = (nodeId: string, fileName: string): NodeFileRefere
   bucket: `files-step-id-${nodeId}`.toLowerCase(),
 });
 
+const normalizeSemTInputImplementation = (
+  value: unknown,
+): SemTInputImplementation => {
+  const implementation =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  const parameters =
+    implementation.parameters &&
+    typeof implementation.parameters === "object" &&
+    !Array.isArray(implementation.parameters)
+      ? implementation.parameters as Record<string, unknown>
+      : {};
+  return {
+    kind: "semt-input",
+    mode: "table-load",
+    parameters: {
+      dataset_id: typeof parameters.dataset_id === "string" ? parameters.dataset_id : "",
+      table_name: typeof parameters.table_name === "string" ? parameters.table_name : "",
+      csv_file: typeof parameters.csv_file === "string" ? parameters.csv_file : "",
+      semt_table_load: parameters.semt_table_load === true,
+    },
+    connection_ref:
+      typeof implementation.connection_ref === "string" && implementation.connection_ref.trim()
+        ? implementation.connection_ref
+        : "default-semt",
+  };
+};
+
 interface PropertiesPanelProps {
   selectedNode: Node<PropertyNodeData> | null;
   onNodeUpdate: (id: string, data: PropertyNodeData) => void;
   onRemoveNode?: (nodeId: string) => void;
+  activeChatbotConfig?: ChatbotConfig | null;
   className?: string;
 }
 
-export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, className }: PropertiesPanelProps) {
+export function PropertiesPanel({
+  selectedNode,
+  onNodeUpdate,
+  onRemoveNode,
+  activeChatbotConfig,
+  className,
+}: PropertiesPanelProps) {
   const nodeType: StepType = normalizeType(selectedNode?.data?.type ?? selectedNode?.type);
   const isSemTNode = String(selectedNode?.data?.definition_id ?? "").startsWith("semt.");
   const isSemTInputDataNode = selectedNode?.data?.definition_id === "core.input-data";
   const canManageFiles = typeHasFiles(nodeType) && !isSemTNode;
+  const canGenerateScript = canManageFiles && !isSemTInputDataNode;
 
   const [label, setLabel] = useState('');
   const [description, setDescription] = useState('');
@@ -101,6 +154,9 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
 
   // storage database dropdown
   const [databaseName, setDatabaseName] = useState<StorageDatabaseOption>("MinIO");
+  const [semtInput, setSemTInput] = useState<SemTInputImplementation>(() =>
+    normalizeSemTInputImplementation(undefined),
+  );
 
   // preview/edit file dialog state
   const [previewFile, setPreviewFile] = useState<File | null>(null);
@@ -112,6 +168,7 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
   const [isEditing, setIsEditing] = useState(false);
   const [editedContent, setEditedContent] = useState('');
   const [previewFileIndex, setPreviewFileIndex] = useState<number>(-1);
+  const [isGeneratingScript, setIsGeneratingScript] = useState(false);
 
   // Debounce backend updates to avoid POST per keystroke
   const backendDebounceRef = useRef<number | null>(null);
@@ -212,6 +269,12 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
       } else {
         setDatabaseName("MinIO");
       }
+
+      setSemTInput(
+        isSemTInputDataNode
+          ? normalizeSemTInputImplementation(selectedNode.data.implementation)
+          : normalizeSemTInputImplementation(undefined),
+      );
     } else {
       setLabel('');
       setDescription('');
@@ -220,6 +283,7 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
       setParam({});
       setEndpoint("");
       setDatabaseName("MinIO");
+      setSemTInput(normalizeSemTInputImplementation(undefined));
     }
 
     // reset preview dialog
@@ -232,7 +296,7 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
     setIsEditing(false);
     setEditedContent('');
     setPreviewFileIndex(-1);
-  }, [selectedNode, nodeType]);
+  }, [selectedNode, nodeType, isSemTInputDataNode]);
 
   const handleLabelChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setLabel(e.target.value);
@@ -257,6 +321,23 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
   const handleDatabaseChange = (val: StorageDatabaseOption) => {
     setDatabaseName(val);
     pushNodeUpdate({ database: val });
+  };
+
+  const updateSemTInput = (
+    patch: Partial<SemTInputImplementation["parameters"]>,
+  ) => {
+    const next: SemTInputImplementation = {
+      ...semtInput,
+      parameters: {
+        ...semtInput.parameters,
+        ...patch,
+      },
+    };
+    setSemTInput(next);
+    pushNodeUpdate({
+      implementation: next,
+      configuration_status: next.parameters.semt_table_load ? "valid" : undefined,
+    });
   };
 
   // Upload newly added files through the backend. Same filename replaces older entry.
@@ -414,6 +495,65 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
     }
   };
 
+  const handleGenerateScript = async () => {
+    if (!selectedNode || !canGenerateScript || isGeneratingScript) return;
+    setIsGeneratingScript(true);
+    let llmConfig: Record<string, unknown> | undefined;
+    try {
+      if (activeChatbotConfig) {
+        llmConfig = buildCodegenLLMRequestConfig(activeChatbotConfig);
+      }
+    } catch (error) {
+      toast("Code generation model required", {
+        description: error instanceof Error ? error.message : "LLM settings are incomplete.",
+      });
+      setIsGeneratingScript(false);
+      return;
+    }
+
+    try {
+      const result = await generateNodeScript(selectedNode.id, {
+        ...(llmConfig ? { llm_config: llmConfig } : {}),
+      });
+      const generatedArtifact = result?.generated_artifact as GeneratedArtifact | undefined;
+      const generatedFiles = Array.isArray(result?.files)
+        ? normalizeFileReferences(result.files)
+        : [];
+      const mergedFiles = [...files];
+      const indexByName = new Map<string, number>();
+      mergedFiles.forEach((file, index) => {
+        const fileName = getNodeFileName(file);
+        if (fileName) indexByName.set(fileName, index);
+      });
+      generatedFiles.forEach((file) => {
+        const fileName = getNodeFileName(file);
+        if (!fileName) return;
+        const existingIndex = indexByName.get(fileName);
+        if (existingIndex == null) {
+          indexByName.set(fileName, mergedFiles.length);
+          mergedFiles.push(file);
+        } else {
+          mergedFiles[existingIndex] = file;
+        }
+      });
+      setFiles(mergedFiles);
+      pushNodeUpdate({
+        files: mergedFiles,
+        ...(generatedArtifact ? { generated_artifact: generatedArtifact } : {}),
+      });
+      const status = generatedArtifact?.validation_report?.status || "generated";
+      toast("Script generated", {
+        description: `Runtime bundle ${status}.`,
+      });
+    } catch (error) {
+      toast("Script generation failed", {
+        description: error instanceof Error ? error.message : "Unknown error",
+      });
+    } finally {
+      setIsGeneratingScript(false);
+    }
+  };
+
   // Config param helpers
   const addParamRow = () => {
     let i = 1;
@@ -537,6 +677,38 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
                 pushNodeUpdate({ generated_artifact: generatedArtifact });
               }}
             />
+
+            {canGenerateScript && (
+              <div className="space-y-3 rounded-md border border-border bg-muted/20 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <Label className="text-sm">Runtime script</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Generate a Python script, requirements file, Dockerfile, and runtime manifest.
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => { void handleGenerateScript(); }}
+                    disabled={isGeneratingScript}
+                  >
+                    {isGeneratingScript ? (
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    ) : (
+                      <Wand2 className="w-4 h-4 mr-2" />
+                    )}
+                    Generate
+                  </Button>
+                </div>
+                {selectedNode.data.generated_artifact?.validation_report && (
+                  <p className="text-xs text-muted-foreground">
+                    Validation: {String(selectedNode.data.generated_artifact.validation_report.status || "unknown")}
+                  </p>
+                )}
+              </div>
+            )}
 
             {/* Content ONLY for input/output */}
             {typeHasContent(nodeType) && (
@@ -667,6 +839,72 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
             )}
 
             {/* SemT source data belongs on the Input Data ingress node, not an operation node. */}
+            {isSemTInputDataNode && (
+              <div className="space-y-3 rounded-md border border-border bg-muted/20 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <Label htmlFor="semt-table-load" className="text-sm">
+                      SemT table load
+                    </Label>
+                    <p className="text-xs text-muted-foreground">
+                      Upload this CSV to SemT before running the operation chain.
+                    </p>
+                  </div>
+                  <Switch
+                    id="semt-table-load"
+                    checked={semtInput.parameters.semt_table_load === true}
+                    onCheckedChange={(checked) =>
+                      updateSemTInput({ semt_table_load: checked === true })
+                    }
+                  />
+                </div>
+
+                {semtInput.parameters.semt_table_load && (
+                  <div className="space-y-3">
+                    <div className="space-y-2">
+                      <Label htmlFor="semt-dataset-id" className="text-sm">
+                        Dataset ID
+                      </Label>
+                      <Input
+                        id="semt-dataset-id"
+                        value={semtInput.parameters.dataset_id ?? ""}
+                        onChange={(event) =>
+                          updateSemTInput({ dataset_id: event.target.value })
+                        }
+                        placeholder="114"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="semt-table-name" className="text-sm">
+                        Table name
+                      </Label>
+                      <Input
+                        id="semt-table-name"
+                        value={semtInput.parameters.table_name ?? ""}
+                        onChange={(event) =>
+                          updateSemTInput({ table_name: event.target.value })
+                        }
+                        placeholder="my_table"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="semt-csv-file" className="text-sm">
+                        Expected CSV filename
+                      </Label>
+                      <Input
+                        id="semt-csv-file"
+                        value={semtInput.parameters.csv_file ?? ""}
+                        onChange={(event) =>
+                          updateSemTInput({ csv_file: event.target.value })
+                        }
+                        placeholder="table.csv"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             {canManageFiles && (
               <div className="space-y-2">
                 <Label className="text-sm">Files</Label>

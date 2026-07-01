@@ -135,6 +135,70 @@ class SemTGeneratorTest(unittest.TestCase):
         self.assertIn("deduplicate=True", source)
         self.assertIn("_resolve_api_base_url", source)
 
+    def test_generation_merges_pipeline_level_semt_settings(self):
+        graph = {
+            "settings": {
+                "semt": {
+                    "base_url": "http://example.test:3003",
+                }
+            },
+            "nodes": [
+                {
+                    "id": "input",
+                    "data": {
+                        "definition_id": "core.input-data",
+                        "implementation": {
+                            "kind": "semt-input",
+                            "mode": "table-load",
+                            "parameters": {
+                                "semt_table_load": True,
+                                "dataset_id": "114",
+                                "table_name": "sample_dataset_jot_AB",
+                                "csv_file": "sample_dataset_jot_AB-1.csv",
+                            },
+                        },
+                    },
+                }
+            ],
+        }
+        bundle = generate_runtime_artifacts(reconciliation_step(), graph)
+        source = next(item.content for item in bundle.files if item.filename == "main.py")
+
+        self.assertIn('"api_base_url":"http://example.test:3003"', source)
+        self.assertIn('"dataset_id":"114"', source)
+        self.assertIn('"table_name":"sample_dataset_jot_AB"', source)
+        self.assertIn('"semt_table_load":true', source)
+        self.assertIn('"column_name":"City"', source)
+        self.assertIn("maybe_load_input_table_to_semt", source)
+
+    def test_node_parameters_override_pipeline_level_semt_settings(self):
+        step = reconciliation_step()
+        step["implementation"]["parameters"]["dataset_id"] = "node-dataset"
+        graph = {
+            "nodes": [
+                {
+                    "id": "input",
+                    "data": {
+                        "definition_id": "core.input-data",
+                        "implementation": {
+                            "kind": "semt-input",
+                            "mode": "table-load",
+                            "parameters": {
+                                "semt_table_load": True,
+                                "dataset_id": "input-dataset",
+                            },
+                        },
+                    },
+                }
+            ],
+        }
+
+        bundle = generate_runtime_artifacts(step, graph)
+        source = next(item.content for item in bundle.files if item.filename == "main.py")
+
+        self.assertIn('"dataset_id":"node-dataset"', source)
+        self.assertNotIn('"dataset_id":"input-dataset"', source)
+
     def test_generated_modification_executes_csv_contract(self):
         bundle = generate_runtime_artifacts(modification_step(), {})
         source = next(item.content for item in bundle.files if item.filename == "main.py")

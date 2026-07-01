@@ -968,7 +968,12 @@ def build_argo_workflow_object(
         )
 
         try:
-            validate_semt_pipeline(all_steps, edges, dockerfiles_by_step)
+            validate_semt_pipeline(
+                all_steps,
+                edges,
+                dockerfiles_by_step,
+                pipeline_graph,
+            )
         except SemTGraphValidationError as exc:
             raise DeploymentArtifactValidationError(
                 "SemT graph contract validation failed",

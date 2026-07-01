@@ -12,10 +12,12 @@ export type NormalizedGraph = {
   updated_at: string | null;
   nodes: Node[];
   edges: Edge[];
+  settings?: Record<string, unknown>;
 };
 
 export type AgentGraphSnapshot = {
   updated_at: string | null;
+  settings?: Record<string, unknown>;
   nodes: Array<{
     id: string;
     type: string;
@@ -54,6 +56,7 @@ export const normalizeGraph = (data: unknown): NormalizedGraph => {
     nodes?: unknown[];
     edges?: unknown[];
     updated_at?: string | null;
+    settings?: unknown;
   };
   const incomingNodes = Array.isArray(parsedGraph.nodes) ? parsedGraph.nodes : [];
   const incomingEdges = Array.isArray(parsedGraph.edges) ? parsedGraph.edges : [];
@@ -105,11 +108,17 @@ export const normalizeGraph = (data: unknown): NormalizedGraph => {
     updated_at: parsedGraph.updated_at ?? null,
     nodes,
     edges,
+    ...(parsedGraph.settings &&
+    typeof parsedGraph.settings === "object" &&
+    !Array.isArray(parsedGraph.settings)
+      ? { settings: parsedGraph.settings as Record<string, unknown> }
+      : {}),
   };
 };
 
 export const createAgentGraphSnapshot = (graph: NormalizedGraph): AgentGraphSnapshot => ({
   updated_at: graph.updated_at,
+  ...(graph.settings ? { settings: graph.settings } : {}),
   nodes: graph.nodes.map((node) => {
     const data = node.data || {};
     const files = Array.isArray(data.files)

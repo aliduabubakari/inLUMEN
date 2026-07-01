@@ -472,7 +472,7 @@ class DeploymentArtifactsTest(unittest.TestCase):
             build_argo_workflow_object(graph, artifacts)
 
         self.assertIn(
-            "Input Data node must contain exactly one CSV file",
+            "Input Data node must contain exactly one uploaded CSV file",
             str(ctx.exception),
         )
 
@@ -486,7 +486,78 @@ class DeploymentArtifactsTest(unittest.TestCase):
         with self.assertRaises(DeploymentArtifactValidationError) as ctx:
             build_argo_workflow_object(graph, dockerfiles)
 
-        self.assertIn("must target the reconciled column", str(ctx.exception))
+        self.assertIn("must target a column reconciled earlier", str(ctx.exception))
+
+    def test_semt_extension_can_follow_intervening_operation_for_reconciled_column(self):
+        graph = self._full_semt_pipeline_graph()
+        weather_extension = {
+            "id": "weather",
+            "data": {
+                "label": "Weather Properties",
+                "type": "action",
+                "definition_id": "semt.extension",
+                "definition_version": 1,
+                "configuration_status": "valid",
+                "implementation": {
+                    "kind": "semt",
+                    "operation": "extension",
+                    "service_id": "meteoPropertiesOpenMeteo",
+                    "parameters": {
+                        "column_name": "City",
+                        "granularity": "daily",
+                        "dateColumnName": "ObservationDate",
+                        "decimalFormat": ".",
+                        "properties": [
+                            "light_hours",
+                            "apparent_temperature_max",
+                        ],
+                    },
+                    "connection_ref": "default-semt",
+                },
+            },
+        }
+        date_formatter = {
+            "id": "format-date",
+            "data": {
+                "label": "Format Date",
+                "type": "action",
+                "definition_id": "semt.modification",
+                "definition_version": 1,
+                "configuration_status": "valid",
+                "implementation": {
+                    "kind": "semt",
+                    "operation": "modification",
+                    "service_id": "dateFormatter",
+                    "parameters": {
+                        "column_name": "ObservationDate",
+                        "formatType": "iso",
+                        "detailLevel": "hourMinutes",
+                        "outputMode": "update",
+                        "selectedColumns": ["ObservationDate"],
+                    },
+                    "connection_ref": "default-semt",
+                },
+            },
+        }
+        graph["nodes"].insert(4, date_formatter)
+        graph["nodes"].insert(5, weather_extension)
+        graph["edges"] = [
+            {"source": "input", "target": "modify"},
+            {"source": "modify", "target": "reconcile"},
+            {"source": "reconcile", "target": "extend"},
+            {"source": "extend", "target": "format-date"},
+            {"source": "format-date", "target": "weather"},
+            {"source": "weather", "target": "export"},
+        ]
+
+        dockerfiles = build_dockerfile_artifacts(graph)
+        workflow = build_argo_workflow_object(graph, dockerfiles)
+
+        task_names = [task["name"] for task in workflow["spec"]["templates"][0]["dag"]["tasks"]]
+        self.assertEqual(
+            ["modify", "reconcile", "extend", "format-date", "weather", "export"],
+            task_names,
+        )
 
     def test_semt_workflow_rejects_stale_runtime_metadata(self):
         graph = self.semt_reference_graph()
@@ -503,8 +574,15 @@ class DeploymentArtifactsTest(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def _full_semt_pipeline_graph(self):
-        """Six-step SemT pipeline: Input → Setup → Mod → Recon → Extend → Export."""
+        """SemT pipeline: Input table-load boundary → Mod → Recon → Extend → Export."""
         return {
+            "settings": {
+                "semt": {
+                    "api_base_url": "http://semt-backend:3003",
+                    "username": "test",
+                    "password": "test",
+                }
+            },
             "nodes": [
                 {
                     "id": "input",
@@ -521,27 +599,14 @@ class DeploymentArtifactsTest(unittest.TestCase):
                                 "snapshot_object": "cities.csv",
                             }
                         ],
-                    },
-                },
-                {
-                    "id": "setup",
-                    "data": {
-                        "label": "SemT Setup",
-                        "type": "action",
-                        "definition_id": "semt.setup",
-                        "definition_version": 1,
-                        "configuration_status": "valid",
                         "implementation": {
-                            "kind": "semt",
-                            "operation": "setup",
-                            "service_id": "semt_connection",
+                            "kind": "semt-input",
+                            "mode": "table-load",
                             "parameters": {
-                                "api_base_url": "http://semt-backend:3003",
-                                "username": "test",
-                                "password": "test",
-                                "token": "",
+                                "semt_table_load": True,
                                 "dataset_id": "114",
                                 "table_name": "my_table",
+                                "csv_file": "cities.csv",
                             },
                             "connection_ref": "default-semt",
                         },
@@ -628,8 +693,7 @@ class DeploymentArtifactsTest(unittest.TestCase):
                 },
             ],
             "edges": [
-                {"source": "input", "target": "setup"},
-                {"source": "setup", "target": "modify"},
+                {"source": "input", "target": "modify"},
                 {"source": "modify", "target": "reconcile"},
                 {"source": "reconcile", "target": "extend"},
                 {"source": "extend", "target": "export"},
@@ -647,8 +711,8 @@ class DeploymentArtifactsTest(unittest.TestCase):
         dockerfiles = dockerfiles_payload["dockerfiles"]
         runtime_artifacts = dockerfiles_payload["runtime_artifacts"]
 
-        # 2. Expect Dockerfiles for all 5 runtime steps (input is excluded)
-        runtime_step_ids = {"setup", "modify", "reconcile", "extend", "export"}
+        # 2. Expect Dockerfiles for SemT operation steps; input remains a boundary.
+        runtime_step_ids = {"modify", "reconcile", "extend", "export"}
         generated_ids = {df["flow_id"] for df in dockerfiles}
         self.assertEqual(runtime_step_ids, generated_ids)
 
@@ -662,11 +726,11 @@ class DeploymentArtifactsTest(unittest.TestCase):
             for required in ("main.py", "requirements.txt", "node-manifest.json"):
                 self.assertIn(required, filenames, f"{fid} missing {required}")
 
-            # Setup and export are standalone → no execute_operation
+            # Export is standalone; operation nodes use the shared SemT base runtime.
             main_py = next(
                 f["content"] for f in artifact["files"] if f["filename"] == "main.py"
             )
-            if definition_id in ("semt.setup", "semt.export"):
+            if definition_id == "semt.export":
                 self.assertNotIn(
                     "execute_operation", main_py,
                     f"{definition_id} should be standalone",
@@ -676,6 +740,10 @@ class DeploymentArtifactsTest(unittest.TestCase):
                     "execute_operation", main_py,
                     f"{definition_id} should use base.py.j2",
                 )
+                if fid == "modify":
+                    self.assertIn('"semt_table_load":true', main_py)
+                    self.assertIn('"dataset_id":"114"', main_py)
+                    self.assertIn('"table_name":"my_table"', main_py)
 
             # No generated script should contain the placeholder URL
             self.assertNotIn(
@@ -697,7 +765,7 @@ class DeploymentArtifactsTest(unittest.TestCase):
         # 5. Verify DAG task ordering — flow_ids become Argo task names
         task_names = [t["name"] for t in dag_tasks]
         self.assertEqual(
-            ["setup", "modify", "reconcile", "extend", "export"],
+            ["modify", "reconcile", "extend", "export"],
             task_names,
         )
 
@@ -718,7 +786,7 @@ class DeploymentArtifactsTest(unittest.TestCase):
 
         # 8. Container checks for each template
         template_by_name = {t["name"]: t for t in templates if t["name"] != "inlumen-pipeline"}
-        for step_id in ("setup", "modify", "reconcile", "extend", "export"):
+        for step_id in ("modify", "reconcile", "extend", "export"):
             step_name = step_id  # flow_id IS the Argo task name
             template = template_by_name[step_name]
             container = template["container"]
@@ -774,7 +842,7 @@ class DeploymentArtifactsTest(unittest.TestCase):
             for p in spec["arguments"]["parameters"]
             if p["name"].startswith("image-")
         }
-        self.assertEqual(5, len(image_params))
+        self.assertEqual(4, len(image_params))
         for value in image_params.values():
             self.assertTrue(value.startswith("ghcr.io/inlumen/semt-"))
             self.assertNotIn(":latest", value)

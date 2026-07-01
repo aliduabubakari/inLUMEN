@@ -1,25 +1,35 @@
 import React from 'react';
 import { Panel } from 'reactflow';
-import { Download, Save, Trash2, Upload } from 'lucide-react';
+import { Code2, Download, Save, Trash2, Upload, Wand2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 type FlowCanvasActionsPanelProps = {
   fileInputRef: React.RefObject<HTMLInputElement>;
+  pipelineInputRef: React.RefObject<HTMLInputElement>;
   onSave: () => void;
   onExportJson: () => void;
   onExportYaml: () => void;
   onImportClick: () => void;
   onImport: (event: React.ChangeEvent<HTMLInputElement>) => void;
+  onPipelineUploadClick: () => void;
+  onPipelineUpload: (event: React.ChangeEvent<HTMLInputElement>) => void;
+  onGenerateScripts: () => void;
+  isGeneratingScripts?: boolean;
   onClear: () => void;
 };
 
 export const FlowCanvasActionsPanel = ({
   fileInputRef,
+  pipelineInputRef,
   onSave,
   onExportJson,
   onExportYaml,
   onImportClick,
   onImport,
+  onPipelineUploadClick,
+  onPipelineUpload,
+  onGenerateScripts,
+  isGeneratingScripts,
   onClear,
 }: FlowCanvasActionsPanelProps) => (
   <Panel position="top-center" className="mt-2 max-w-[calc(100vw-2rem)]">
@@ -52,6 +62,32 @@ export const FlowCanvasActionsPanel = ({
         className="hidden"
         onChange={onImport}
       />
+      <Button
+        size="sm"
+        variant="outline"
+        className="flex items-center gap-1 h-7"
+        onClick={onPipelineUploadClick}
+      >
+        <Code2 className="h-3.5 w-3.5" />
+        Pipeline
+      </Button>
+      <input
+        ref={pipelineInputRef}
+        type="file"
+        accept=".py"
+        className="hidden"
+        onChange={onPipelineUpload}
+      />
+      <Button
+        size="sm"
+        variant="outline"
+        className="flex items-center gap-1 h-7"
+        onClick={onGenerateScripts}
+        disabled={isGeneratingScripts}
+      >
+        <Wand2 className="h-3.5 w-3.5" />
+        {isGeneratingScripts ? "Generating" : "Scripts"}
+      </Button>
       <Button
         size="sm"
         variant="destructive"

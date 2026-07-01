@@ -966,6 +966,7 @@ const Index = () => {
                       selectedNode={selectedNode}
                       onNodeUpdate={onNodeUpdate}
                       onRemoveNode={handleRemoveNode}
+                      activeChatbotConfig={activeConfig}
                     />
                   ) : rightPanel === 'chat' ? (
                     <ChatPanel
@@ -1132,6 +1133,10 @@ const Index = () => {
                 <div>
                   <span className="font-medium text-foreground">Model:</span>{" "}
                   {activeConfig.model}
+                </div>
+                <div>
+                  <span className="font-medium text-foreground">Code generation:</span>{" "}
+                  {activeConfig.codegenModel?.trim() || "Not configured"}
                 </div>
                 <div className="truncate">
                   <span className="font-medium text-foreground">Base URL:</span>{" "}

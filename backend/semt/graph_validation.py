@@ -32,6 +32,73 @@ def is_semt_step(step: dict[str, Any]) -> bool:
     return str(step.get("definition_id") or "").startswith("semt.")
 
 
+def _semt_settings_parameters(graph: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(graph, dict):
+        return {}
+    settings = graph.get("settings")
+    if not isinstance(settings, dict):
+        return {}
+    semt = settings.get("semt")
+    if not isinstance(semt, dict):
+        return {}
+    parameters: dict[str, Any] = {}
+    api_base_url = str(
+        semt.get("api_base_url") or semt.get("base_url") or semt.get("api_url") or ""
+    ).strip().rstrip("/")
+    if api_base_url.endswith("/api"):
+        api_base_url = api_base_url[:-4].rstrip("/")
+    if api_base_url:
+        parameters["api_base_url"] = api_base_url
+    for key in ("username", "password", "token"):
+        value = semt.get(key)
+        if value not in (None, ""):
+            parameters[key] = value
+    return parameters
+
+
+def _semt_table_load_parameters(steps: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    for step in steps:
+        if str(step.get("definition_id") or "") != SEMT_INPUT_DEFINITION_ID:
+            continue
+        implementation = step.get("implementation")
+        if not isinstance(implementation, dict):
+            continue
+        if str(implementation.get("kind") or "") != "semt-input":
+            continue
+        parameters = implementation.get("parameters")
+        if not isinstance(parameters, dict) or parameters.get("semt_table_load") is not True:
+            continue
+        result: dict[str, Any] = {"semt_table_load": True}
+        for key in ("dataset_id", "table_name", "csv_file"):
+            value = parameters.get(key)
+            if value not in (None, ""):
+                result[key] = value
+        return result
+    return {}
+
+
+def _implementation_with_graph_context(
+    implementation: dict[str, Any],
+    steps: Sequence[dict[str, Any]],
+    graph: dict[str, Any] | None,
+) -> dict[str, Any]:
+    global_parameters = _semt_settings_parameters(graph)
+    table_load_parameters = _semt_table_load_parameters(steps)
+    if not global_parameters and not table_load_parameters:
+        return implementation
+    current_parameters = implementation.get("parameters")
+    if not isinstance(current_parameters, dict):
+        current_parameters = {}
+    return {
+        **implementation,
+        "parameters": {
+            **global_parameters,
+            **table_load_parameters,
+            **current_parameters,
+        },
+    }
+
+
 def _is_semt_input_step(step: dict[str, Any]) -> bool:
     return str(step.get("definition_id") or "") == SEMT_INPUT_DEFINITION_ID
 
@@ -40,6 +107,53 @@ def _is_semt_table_step(step: dict[str, Any]) -> bool:
     """SemT steps that participate in the table processing chain."""
     definition_id = str(step.get("definition_id") or "")
     return definition_id in SEMT_DEFINITION_IDS and definition_id not in SEMT_NON_TABLE_DEFINITION_IDS
+
+
+def _implementation_parameters(step: dict[str, Any]) -> dict[str, Any]:
+    implementation = step.get("implementation")
+    if not isinstance(implementation, dict):
+        return {}
+    parameters = implementation.get("parameters")
+    return parameters if isinstance(parameters, dict) else {}
+
+
+def _upstream_reconciliations_for_column(
+    flow_id: str,
+    column_name: Any,
+    incoming: dict[str, list[str]],
+    steps_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Return upstream reconciliations for the requested target column.
+
+    Extension operations can depend on reconciliation metadata produced earlier in
+    the table chain, even when another SemT table operation sits between the
+    reconciliation and extension. Keep the check column-aware so unrelated
+    upstream reconciliations do not accidentally satisfy the contract.
+    """
+    target_column = str(column_name or "")
+    if not target_column:
+        return []
+
+    matches: list[str] = []
+    stack = list(incoming.get(flow_id) or [])
+    visited: set[str] = set()
+    while stack:
+        parent_id = stack.pop()
+        if parent_id in visited:
+            continue
+        visited.add(parent_id)
+        parent = steps_by_id.get(parent_id)
+        if not parent:
+            continue
+        parent_definition_id = str(parent.get("definition_id") or "")
+        parent_column = str(_implementation_parameters(parent).get("column_name") or "")
+        if (
+            parent_definition_id == "semt.reconciliation"
+            and parent_column == target_column
+        ):
+            matches.append(parent_id)
+        stack.extend(incoming.get(parent_id) or [])
+    return matches
 
 
 def get_semt_ingress_artifact(
@@ -79,6 +193,7 @@ def validate_semt_pipeline(
     steps: Sequence[dict[str, Any]],
     edges: Sequence[dict[str, Any]],
     dockerfiles_by_step: dict[str, dict[str, Any]],
+    graph: dict[str, Any] | None = None,
 ) -> None:
     semt_steps = [step for step in steps if is_semt_step(step)]
     if not semt_steps:
@@ -115,7 +230,9 @@ def validate_semt_pipeline(
             outgoing[source].append(target)
             incoming[target].append(source)
 
-    if len(semt_steps) > 1 and not any(incoming.values()):
+    # Only require edges when multiple table-processing nodes exist.
+    # A single table node chained from a non-table setup node is fine.
+    if len(table_semt_steps) > 1 and not any(incoming.values()):
         errors.append("SemT nodes must be connected by explicit graph edges.")
 
     roots = []
@@ -183,7 +300,10 @@ def validate_semt_pipeline(
 
         files = input_step.get("files") or []
         if len(files) != 1:
-            errors.append("The SemT Input Data node must contain exactly one CSV file.")
+            errors.append(
+                "The SemT Input Data node must contain exactly one uploaded CSV file "
+                "so Argo can mount it as /data/input.csv."
+            )
         elif not isinstance(files[0], dict):
             errors.append("The SemT Input Data file metadata is invalid.")
         else:
@@ -207,6 +327,11 @@ def validate_semt_pipeline(
         definition_id = str(step.get("definition_id") or "")
         implementation = step.get("implementation")
         implementation = implementation if isinstance(implementation, dict) else {}
+        implementation = _implementation_with_graph_context(
+            implementation,
+            steps,
+            graph,
+        )
 
         if definition_id not in SEMT_DEFINITION_IDS:
             errors.append(
@@ -267,23 +392,22 @@ def validate_semt_pipeline(
             )
 
         if definition_id == "semt.extension":
+            extension_parameters = implementation.get("parameters") or {}
             parents = incoming[flow_id]
             if len(parents) != 1:
                 errors.append(
-                    f"SemT extension {flow_id!r} must directly follow one reconciliation node."
+                    f"SemT extension {flow_id!r} must have exactly one table input."
                 )
                 continue
-            parent = steps_by_id[parents[0]]
-            if parent.get("definition_id") != "semt.reconciliation":
+            upstream_reconciliations = _upstream_reconciliations_for_column(
+                flow_id,
+                extension_parameters.get("column_name"),
+                incoming,
+                steps_by_id,
+            )
+            if not upstream_reconciliations:
                 errors.append(
-                    f"SemT extension {flow_id!r} must directly follow reconciliation."
-                )
-                continue
-            parent_parameters = (parent.get("implementation") or {}).get("parameters") or {}
-            extension_parameters = implementation.get("parameters") or {}
-            if parent_parameters.get("column_name") != extension_parameters.get("column_name"):
-                errors.append(
-                    f"SemT extension {flow_id!r} must target the reconciled column."
+                    f"SemT extension {flow_id!r} must target a column reconciled earlier in the pipeline."
                 )
 
     if errors:
