@@ -88,6 +88,8 @@ export type PipelineGenerationRun = {
 export type PipelineGenerationJob = {
   run_id?: string;
   status?: string;
+  resumed_from_run_id?: string | null;
+  resume_from_flow_id?: string | null;
   generation_run?: PipelineGenerationRun | null;
   result?: unknown;
   error?: string | null;
@@ -568,6 +570,44 @@ export const fetchPipelineScriptGenerationRun = async (
   const response = await apiFetch(
     `${INLUMEN_API_URL}/api/pipeline/generation-runs/${encodeURIComponent(runId)}`,
     { method: "GET" },
+  );
+  if (!response.ok) {
+    const errorPayload = await response.json().catch(async () => ({
+      error: await response.text().catch(() => ""),
+    }));
+    const message = formatPipelineGenerationError(
+      errorPayload,
+      response.status,
+      response.statusText,
+    );
+    const error = new Error(message);
+    (error as Error & { payload?: unknown }).payload = errorPayload;
+    throw error;
+  }
+  return response.json();
+};
+
+export const resumePipelineScriptGenerationRun = async (
+  runId: string,
+  options: {
+    flowId?: string;
+    repairAttempts?: number;
+    userInstruction?: string;
+  } = {},
+): Promise<PipelineGenerationJob> => {
+  const response = await apiFetch(
+    `${INLUMEN_API_URL}/api/pipeline/generation-runs/${encodeURIComponent(runId)}/resume`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        flow_id: options.flowId || "",
+        repair_attempts: options.repairAttempts ?? 4,
+        user_instruction: options.userInstruction || "",
+      }),
+    },
   );
   if (!response.ok) {
     const errorPayload = await response.json().catch(async () => ({

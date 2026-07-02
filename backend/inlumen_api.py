@@ -550,6 +550,31 @@ def _post_codegen_pipeline_run_request(payload: dict[str, Any]) -> dict[str, Any
     return parsed
 
 
+def _post_codegen_pipeline_run_resume_request(
+    run_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    encoded = json.dumps(payload).encode("utf-8")
+    http_request = Request(
+        f"{CODEGEN_SERVICE_URL}/v1/generate/pipeline-scripts/runs/{run_id}/resume",
+        data=encoded,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(http_request, timeout=CODEGEN_NODE_REQUEST_TIMEOUT_SECONDS) as response:
+            response_payload = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Codegen service rejected request: {exc.code} {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Codegen service unavailable at {CODEGEN_SERVICE_URL}: {exc}") from exc
+    parsed = json.loads(response_payload)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Codegen service returned an invalid response")
+    return parsed
+
+
 def _get_codegen_pipeline_run_request(run_id: str) -> dict[str, Any]:
     http_request = Request(
         f"{CODEGEN_SERVICE_URL}/v1/generate/pipeline-scripts/runs/{run_id}",
@@ -1362,6 +1387,63 @@ def pipeline_generation_runs():
         ), 202
     except Exception as exc:
         return _json_error(502, "pipeline script generation failed", str(exc))
+
+
+@app.route("/api/pipeline/generation-runs/<run_id>/resume", methods=["POST", "OPTIONS"])
+@require_auth
+def pipeline_generation_run_resume(run_id: str):
+    if request.method == "OPTIONS":
+        return _preflight_response()
+    payload = _request_json()
+    try:
+        local_run = PIPELINE_GENERATION_RUNS.get(run_id)
+        if local_run is None:
+            return _json_error(
+                404,
+                "pipeline generation run cannot be resumed; backend run metadata is unavailable",
+            )
+        resume_payload = {
+            "flow_id": str(payload.get("flow_id") or "").strip() or None,
+            "repair_attempts": payload.get("repair_attempts", 4),
+            "user_instruction": str(payload.get("user_instruction") or ""),
+        }
+        codegen_run = _post_codegen_pipeline_run_resume_request(
+            run_id,
+            resume_payload,
+        )
+        new_run_id = str(codegen_run.get("run_id") or "").strip()
+        if not new_run_id:
+            return _json_error(502, "codegen service did not return a resumed run_id")
+
+        metadata = dict(local_run.get("metadata") or {})
+        options = dict(metadata.get("options") or {})
+        try:
+            options["repair_attempts"] = max(
+                int(options.get("repair_attempts") or 0),
+                int(resume_payload["repair_attempts"] or 4),
+            )
+        except (TypeError, ValueError):
+            options["repair_attempts"] = 4
+        metadata["options"] = options
+        metadata["generation_mode"] = "repair"
+        PIPELINE_GENERATION_RUNS[new_run_id] = {
+            "graph": local_run["graph"],
+            "metadata": metadata,
+            "persisted": False,
+            "resumed_from_run_id": run_id,
+            "created_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+        }
+        return jsonify(
+            {
+                **codegen_run,
+                "mode": metadata["generation_mode"],
+                "data_awareness": metadata.get("data_awareness", {}),
+                "persistence": {"status": "pending"},
+            }
+        ), 202
+    except Exception as exc:
+        return _json_error(502, "pipeline generation run resume failed", str(exc))
 
 
 @app.route("/api/pipeline/generation-runs/<run_id>", methods=["GET", "OPTIONS"])

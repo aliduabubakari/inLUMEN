@@ -30,6 +30,7 @@ import {
   fetchPipelineUpdatedAt,
   generatePipelineScripts,
   generatePipelineYaml,
+  resumePipelineScriptGenerationRun,
   startPipelineScriptGenerationRun,
   type PipelineVersionGraph,
   type PipelineVersionSummary,
@@ -216,7 +217,7 @@ const modeToGenerationOptions = (
     includeSampleData: true,
     validationMode: "pipeline_sample" as const,
     allowDeterministicFallback: false,
-    repairAttempts: 2,
+    repairAttempts: 4,
   };
 };
 
@@ -246,6 +247,11 @@ const generationFailureMessage = (job: PipelineGenerationJob) => {
     job.persistence?.reason ||
     "Pipeline script generation did not complete successfully."
   );
+};
+
+const failedGenerationStep = (job: PipelineGenerationJob | null) => {
+  const steps = job?.generation_run?.steps || [];
+  return steps.find((step) => String(step.status || "").toLowerCase() === "invalid");
 };
 
 const semtConnectionSettingsFromSetup = (
@@ -798,6 +804,21 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
     setIsScriptGenerationOpen(true);
   };
 
+  const pollPipelineGenerationRun = async (started: PipelineGenerationJob) => {
+    setGenerationJob(started);
+    const runId = String(started.run_id || "").trim();
+    if (!runId) {
+      throw new Error("Pipeline generation run did not return a run id.");
+    }
+    let latest = started;
+    while (!["valid", "invalid", "failed"].includes(String(latest.status || ""))) {
+      await wait(3000);
+      latest = await fetchPipelineScriptGenerationRun(runId);
+      setGenerationJob(latest);
+    }
+    return latest;
+  };
+
   const handleRunPipelineScriptGeneration = async () => {
     if (isGeneratingScripts) return;
     const mode =
@@ -815,17 +836,7 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
           activeChatbotConfig,
           options,
         );
-        setGenerationJob(started);
-        const runId = String(started.run_id || "").trim();
-        if (!runId) {
-          throw new Error("Pipeline generation run did not return a run id.");
-        }
-        let latest = started;
-        while (!["valid", "invalid", "failed"].includes(String(latest.status || ""))) {
-          await wait(3000);
-          latest = await fetchPipelineScriptGenerationRun(runId);
-          setGenerationJob(latest);
-        }
+        const latest = await pollPipelineGenerationRun(started);
         if (
           latest.status !== "valid" ||
           latest.persistence?.status !== "persisted"
@@ -848,6 +859,50 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
     } catch (error) {
       console.error("[FlowCanvas.tsx] Generate pipeline scripts error:", error);
       toast.error("Script generation failed", {
+        description: error instanceof Error ? error.message : "Unknown error",
+      });
+    } finally {
+      setIsGeneratingScripts(false);
+    }
+  };
+
+  const handleRepairFailedPipelineNode = async () => {
+    if (isGeneratingScripts) return;
+    const currentRunId = String(generationJob?.run_id || "").trim();
+    const failedStep = failedGenerationStep(generationJob);
+    const failedFlowId = String(failedStep?.flow_id || "").trim();
+    if (!currentRunId || !failedFlowId) {
+      toast.error("Repair unavailable", {
+        description: "No failed node was found for this generation run.",
+      });
+      return;
+    }
+    setIsGeneratingScripts(true);
+    try {
+      markLocalWrite(5000);
+      const started = await resumePipelineScriptGenerationRun(currentRunId, {
+        flowId: failedFlowId,
+        repairAttempts: 4,
+      });
+      const latest = await pollPipelineGenerationRun(started);
+      if (
+        latest.status !== "valid" ||
+        latest.persistence?.status !== "persisted"
+      ) {
+        throw new Error(generationFailureMessage(latest));
+      }
+      const persistedResult = latest.persistence?.result as { nodes?: unknown[] } | undefined;
+      const generatedCount = Array.isArray(persistedResult?.nodes)
+        ? persistedResult.nodes.length
+        : 0;
+      await fetchGraphAndApply();
+      setIsScriptGenerationOpen(false);
+      toast.success("Failed node repaired", {
+        description: `${generatedCount} node bundle${generatedCount === 1 ? "" : "s"} persisted.`,
+      });
+    } catch (error) {
+      console.error("[FlowCanvas.tsx] Repair pipeline script error:", error);
+      toast.error("Node repair failed", {
         description: error instanceof Error ? error.message : "Unknown error",
       });
     } finally {
@@ -1061,6 +1116,12 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
 
   const generationSteps = generationJob?.generation_run?.steps || [];
   const generationProgress = generationProgressPercent(generationJob);
+  const repairableFailedStep = failedGenerationStep(generationJob);
+  const canRepairFailedNode = Boolean(
+    generationJob &&
+      ["invalid", "failed"].includes(String(generationJob.status || "")) &&
+      repairableFailedStep?.flow_id,
+  );
 
   return (
     <div ref={reactFlowWrapper} className="h-full w-full">
@@ -1234,6 +1295,16 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
             >
               Cancel
             </Button>
+            {canRepairFailedNode && (
+              <Button
+                variant="outline"
+                onClick={() => { void handleRepairFailedPipelineNode(); }}
+                disabled={isGeneratingScripts}
+              >
+                {isGeneratingScripts && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Repair Node {repairableFailedStep?.flow_id}
+              </Button>
+            )}
             <Button
               onClick={() => { void handleRunPipelineScriptGeneration(); }}
               disabled={
