@@ -32,6 +32,7 @@ DOCKERFILE_INSTRUCTIONS = {
 DOCKERFILE_NAME_RE = re.compile(r"^Dockerfile\.([A-Za-z0-9][A-Za-z0-9_.-]*)$")
 STEP_ID_RE = re.compile(r"files-step-id-([^/]+)$")
 SEMT_INPUT_DEFINITION_ID = "core.input-data"
+CODEGEN_GENERATOR = "inlumen-codegen-service"
 
 
 class DeploymentArtifactValidationError(ValueError):
@@ -717,6 +718,250 @@ def _dependency_lookup(step_ids: Sequence[str], edges: Sequence[dict]) -> Dict[s
     return dependencies
 
 
+def _is_current_codegen_step(step: dict) -> bool:
+    artifact = step.get("generated_artifact")
+    if not isinstance(artifact, dict):
+        return False
+    if _clean_string(artifact.get("generator")) != CODEGEN_GENERATOR:
+        return False
+    return (_clean_string(artifact.get("status")) or "current").lower() == "current"
+
+
+def _step_data_contract(step: dict) -> dict:
+    artifact = step.get("generated_artifact")
+    if not isinstance(artifact, dict):
+        return {}
+    contract = artifact.get("data_contract")
+    return contract if isinstance(contract, dict) else {}
+
+
+def _contract_env_name(contract: dict, key: str, default: str) -> str:
+    value = _clean_string(contract.get(key))
+    return value if value else default
+
+
+def _validate_codegen_argo_shape(
+    *,
+    ordered_ids: Sequence[str],
+    dependencies: Dict[str, List[str]],
+) -> None:
+    errors: List[str] = []
+    for step_id in ordered_ids:
+        parents = dependencies.get(step_id) or []
+        if len(parents) > 1:
+            errors.append(
+                f"Node {step_id} has multiple upstream parents; generated-script Argo "
+                "handoff currently requires an explicit merge node first."
+            )
+    if errors:
+        raise DeploymentArtifactValidationError(
+            "Generated-script Argo Workflow guardrail validation failed",
+            errors,
+        )
+
+
+def _build_codegen_argo_workflow_object(
+    *,
+    steps: Sequence[dict],
+    ordered_ids: Sequence[str],
+    dependencies: Dict[str, List[str]],
+    dockerfiles_by_step: Dict[str, dict],
+) -> dict:
+    _validate_codegen_argo_shape(
+        ordered_ids=ordered_ids,
+        dependencies=dependencies,
+    )
+
+    steps_by_id = {step["flow_id"]: step for step in steps}
+    child_lookup: Dict[str, List[str]] = {step_id: [] for step_id in ordered_ids}
+    for child, parents in dependencies.items():
+        for parent in parents:
+            child_lookup[parent].append(child)
+    leaf_ids = [step_id for step_id in ordered_ids if not child_lookup[step_id]]
+
+    tasks = []
+    entry_template = {
+        "name": "inlumen-pipeline",
+        "dag": {"tasks": tasks},
+    }
+    if leaf_ids:
+        entry_template["outputs"] = {
+            "artifacts": [
+                {
+                    "name": "result" if len(leaf_ids) == 1 else f"result-{_argo_name(leaf_id)}",
+                    "from": f"{{{{tasks.{_argo_name(leaf_id)}.outputs.artifacts.outputs}}}}",
+                }
+                for leaf_id in leaf_ids
+            ]
+        }
+
+    templates = [entry_template]
+    image_parameters = []
+
+    for step_id in ordered_ids:
+        parent_ids = dependencies.get(step_id) or []
+        task = {
+            "name": _argo_name(step_id),
+            "template": _argo_name(step_id),
+            "arguments": {
+                "artifacts": [
+                    {
+                        "name": "inputs",
+                        **(
+                            {
+                                "from": f"{{{{tasks.{_argo_name(parent_ids[0])}.outputs.artifacts.outputs}}}}"
+                            }
+                            if parent_ids
+                            else {
+                                "s3": {
+                                    "key": "{{workflow.parameters.input-artifact-key}}"
+                                }
+                            }
+                        ),
+                    }
+                ]
+            },
+        }
+        if parent_ids:
+            task["dependencies"] = [_argo_name(parent) for parent in parent_ids]
+        tasks.append(task)
+
+    for step_id in ordered_ids:
+        step = steps_by_id[step_id]
+        dockerfile = dockerfiles_by_step[step_id]
+        contract = _step_data_contract(step)
+        image_parameter = _argo_name(f"image-{step_id}", "image")
+        image_parameters.append(
+            {
+                "name": image_parameter,
+                "value": dockerfile["image"],
+            }
+        )
+
+        command = dockerfile.get("command")
+        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+            command = _extract_json_cmd_from_dockerfile(_clean_string(dockerfile.get("content")))
+        if not command:
+            command = ["python", "/app/main.py"]
+
+        output_artifact = {
+            "name": "outputs",
+            "path": "/inlumen/outputs",
+            "archive": {"none": {}},
+        }
+        if step_id in leaf_ids:
+            output_artifact["s3"] = {
+                "key": f"{{{{workflow.parameters.output-artifact-prefix}}}}/{_argo_name(step_id)}"
+            }
+
+        env = [
+            {"name": "INLUMEN_FLOW_ID", "value": step_id},
+            {
+                "name": _contract_env_name(
+                    contract,
+                    "input_manifest_env",
+                    "INLUMEN_INPUT_MANIFEST",
+                ),
+                "value": "/inlumen/inputs/input_manifest.json",
+            },
+            {
+                "name": _contract_env_name(
+                    contract,
+                    "output_dir_env",
+                    "INLUMEN_OUTPUT_DIR",
+                ),
+                "value": "/inlumen/outputs",
+            },
+            {
+                "name": _contract_env_name(
+                    contract,
+                    "output_manifest_env",
+                    "INLUMEN_OUTPUT_MANIFEST",
+                ),
+                "value": "/inlumen/outputs/output_manifest.json",
+            },
+            {
+                "name": _contract_env_name(
+                    contract,
+                    "context_path_env",
+                    "INLUMEN_CONTEXT_PATH",
+                ),
+                "value": "/app/node-manifest.json",
+            },
+        ]
+        if step.get("label"):
+            env.append({"name": "INLUMEN_STEP_LABEL", "value": step["label"]})
+        if step.get("description"):
+            env.append({"name": "INLUMEN_STEP_DESCRIPTION", "value": step["description"]})
+
+        annotations = {
+            "inlumen.ai/flow-id": step_id,
+            "inlumen.ai/type": step.get("type") or "custom",
+            "inlumen.ai/generator": CODEGEN_GENERATOR,
+            "inlumen.ai/dockerfile": dockerfile["dockerfile_filename"],
+        }
+        if dockerfile.get("configuration_hash"):
+            annotations["inlumen.ai/configuration-hash"] = dockerfile["configuration_hash"]
+        if step.get("label"):
+            annotations["inlumen.ai/label"] = step["label"]
+
+        templates.append(
+            {
+                "name": _argo_name(step_id),
+                "metadata": {"annotations": annotations},
+                "inputs": {
+                    "artifacts": [
+                        {
+                            "name": "inputs",
+                            "path": "/inlumen/inputs",
+                        }
+                    ]
+                },
+                "outputs": {"artifacts": [output_artifact]},
+                "container": {
+                    "image": f"{{{{workflow.parameters.{image_parameter}}}}}",
+                    "imagePullPolicy": "IfNotPresent",
+                    "workingDir": "/app",
+                    "command": command,
+                    "env": env,
+                },
+            }
+        )
+
+    return {
+        "apiVersion": "argoproj.io/v1alpha1",
+        "kind": "Workflow",
+        "metadata": {
+            "generateName": "inlumen-codegen-",
+            "labels": {
+                "app.kubernetes.io/name": "inlumen-codegen-workflow",
+                "app.kubernetes.io/component": "deployment-artifact",
+            },
+        },
+        "spec": {
+            "entrypoint": "inlumen-pipeline",
+            "artifactRepositoryRef": {
+                "configMap": "inlumen-artifact-repositories",
+                "key": "minio",
+            },
+            "arguments": {
+                "parameters": [
+                    {
+                        "name": "input-artifact-key",
+                        "value": "inlumen/input/input-artifact.tgz",
+                    },
+                    {
+                        "name": "output-artifact-prefix",
+                        "value": "inlumen/output",
+                    },
+                    *image_parameters,
+                ],
+            },
+            "templates": templates,
+        },
+    }
+
+
 def _semt_secret_env(name: str, key: str) -> dict:
     return {
         "name": name,
@@ -985,6 +1230,16 @@ def build_argo_workflow_object(
             dependencies=dependencies,
             dockerfiles_by_step=dockerfiles_by_step,
             ingress_artifact=get_semt_ingress_artifact(all_steps, edges),
+        )
+        validate_argo_workflow_object(workflow, step_ids)
+        return workflow
+
+    if steps and all(_is_current_codegen_step(step) for step in steps):
+        workflow = _build_codegen_argo_workflow_object(
+            steps=steps,
+            ordered_ids=ordered_ids,
+            dependencies=dependencies,
+            dockerfiles_by_step=dockerfiles_by_step,
         )
         validate_argo_workflow_object(workflow, step_ids)
         return workflow

@@ -332,6 +332,134 @@ class DeploymentArtifactsTest(unittest.TestCase):
         self.assertIn('template: "step-3"', yaml_text)
         self.assertNotIn("```", yaml_text)
 
+    def test_codegen_runtime_workflow_uses_manifest_handoff_contract(self):
+        configuration_hash = "sha256:" + ("b" * 64)
+        graph = {
+            "nodes": [
+                {
+                    "id": "1",
+                    "data": {
+                        "label": "Data Ingestion",
+                        "type": "input",
+                        "generated_artifact": {
+                            "status": "current",
+                            "generator": "inlumen-codegen-service",
+                            "configuration_hash": configuration_hash,
+                            "data_contract": {
+                                "input_manifest_env": "INLUMEN_INPUT_MANIFEST",
+                                "output_dir_env": "INLUMEN_OUTPUT_DIR",
+                                "output_manifest_env": "INLUMEN_OUTPUT_MANIFEST",
+                                "context_path_env": "INLUMEN_CONTEXT_PATH",
+                            },
+                        },
+                    },
+                },
+                {
+                    "id": "2",
+                    "data": {
+                        "label": "Preprocessing",
+                        "type": "action",
+                        "generated_artifact": {
+                            "status": "current",
+                            "generator": "inlumen-codegen-service",
+                            "configuration_hash": configuration_hash,
+                            "data_contract": {
+                                "input_manifest_env": "INLUMEN_INPUT_MANIFEST",
+                                "output_dir_env": "INLUMEN_OUTPUT_DIR",
+                                "output_manifest_env": "INLUMEN_OUTPUT_MANIFEST",
+                                "context_path_env": "INLUMEN_CONTEXT_PATH",
+                            },
+                        },
+                    },
+                },
+            ],
+            "edges": [{"source": "1", "target": "2"}],
+        }
+        dockerfile_content = "\n".join(
+            [
+                "FROM python:3.11-slim",
+                "WORKDIR /app",
+                'COPY ["requirements.txt", "/app/requirements.txt"]',
+                "RUN pip install --no-cache-dir -r requirements.txt",
+                'COPY ["main.py", "/app/main.py"]',
+                'COPY ["node-manifest.json", "/app/node-manifest.json"]',
+                'CMD ["python", "/app/main.py"]',
+                "",
+            ]
+        )
+        dockerfiles = {
+            "dockerfiles": [
+                {
+                    "dockerfile_filename": "Dockerfile.1",
+                    "content": dockerfile_content,
+                    "flow_id": "1",
+                    "image": "ghcr.io/inlumen/codegen-1:bbbbbbbbbbbb",
+                    "command": ["python", "/app/main.py"],
+                    "files": ["requirements.txt", "main.py", "node-manifest.json"],
+                    "generator": "inlumen-codegen-service",
+                    "configuration_hash": configuration_hash,
+                    "build_manifest": "node-manifest.json",
+                },
+                {
+                    "dockerfile_filename": "Dockerfile.2",
+                    "content": dockerfile_content,
+                    "flow_id": "2",
+                    "image": "ghcr.io/inlumen/codegen-2:bbbbbbbbbbbb",
+                    "command": ["python", "/app/main.py"],
+                    "files": ["requirements.txt", "main.py", "node-manifest.json"],
+                    "generator": "inlumen-codegen-service",
+                    "configuration_hash": configuration_hash,
+                    "build_manifest": "node-manifest.json",
+                },
+            ]
+        }
+
+        workflow = build_argo_workflow_object(graph, dockerfiles)
+        validate_argo_workflow_object(workflow, expected_step_ids=["1", "2"])
+
+        spec = workflow["spec"]
+        self.assertEqual(
+            {
+                "configMap": "inlumen-artifact-repositories",
+                "key": "minio",
+            },
+            spec["artifactRepositoryRef"],
+        )
+        tasks = spec["templates"][0]["dag"]["tasks"]
+        self.assertEqual(
+            "{{workflow.parameters.input-artifact-key}}",
+            tasks[0]["arguments"]["artifacts"][0]["s3"]["key"],
+        )
+        self.assertEqual(
+            "{{tasks.step-1.outputs.artifacts.outputs}}",
+            tasks[1]["arguments"]["artifacts"][0]["from"],
+        )
+        self.assertEqual(["step-1"], tasks[1]["dependencies"])
+
+        first_template = spec["templates"][1]
+        second_template = spec["templates"][2]
+        self.assertEqual(
+            "/inlumen/inputs",
+            first_template["inputs"]["artifacts"][0]["path"],
+        )
+        self.assertEqual(
+            "/inlumen/outputs",
+            first_template["outputs"]["artifacts"][0]["path"],
+        )
+        self.assertEqual(
+            "{{workflow.parameters.output-artifact-prefix}}/step-2",
+            second_template["outputs"]["artifacts"][0]["s3"]["key"],
+        )
+        env_by_name = {item["name"]: item["value"] for item in first_template["container"]["env"]}
+        self.assertEqual("/inlumen/inputs/input_manifest.json", env_by_name["INLUMEN_INPUT_MANIFEST"])
+        self.assertEqual("/inlumen/outputs", env_by_name["INLUMEN_OUTPUT_DIR"])
+        self.assertEqual("/inlumen/outputs/output_manifest.json", env_by_name["INLUMEN_OUTPUT_MANIFEST"])
+        self.assertEqual("/app/node-manifest.json", env_by_name["INLUMEN_CONTEXT_PATH"])
+
+        yaml_text = build_argo_workflow_yaml(graph, dockerfiles)
+        self.assertIn('generateName: "inlumen-codegen-"', yaml_text)
+        self.assertIn('artifactRepositoryRef:', yaml_text)
+
     def test_argo_guardrail_requires_dockerfile_for_each_step(self):
         dockerfiles = build_dockerfile_artifacts(self.graph)
         dockerfiles["dockerfiles"] = dockerfiles["dockerfiles"][:2]

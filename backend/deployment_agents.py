@@ -20,6 +20,8 @@ from generators.registry import GeneratorRegistry
 from llm_config import LLMConfig, resolve_llm_config, select_model_client
 from minio_gateway import read_minio_object
 
+CODEGEN_GENERATOR = "inlumen-codegen-service"
+
 
 class ListDockerfilesResponse(BaseModel):
     class DockerfileItem(BaseModel):
@@ -69,13 +71,36 @@ async def generate_dockerfiles_with_agent(
 
     generator_registry = GeneratorRegistry()
     deterministic_bundles = []
+    codegen_runtime_artifacts: list[dict[str, Any]] = []
+    codegen_dockerfiles: list[dict[str, Any]] = []
     generic_steps = []
+    artifact_errors: list[str] = []
     for step in steps:
+        codegen_artifact = _codegen_artifact_for_step(step)
+        if codegen_artifact is not None:
+            try:
+                runtime_artifact, dockerfile = await _read_persisted_codegen_artifact(
+                    step,
+                    codegen_artifact,
+                )
+            except DeploymentArtifactValidationError as exc:
+                artifact_errors.extend(exc.errors)
+                continue
+            codegen_runtime_artifacts.append(runtime_artifact)
+            codegen_dockerfiles.append(dockerfile)
+            continue
+
         generator = generator_registry.generator_for_step(step)
         if generator is None:
             generic_steps.append(step)
             continue
         deterministic_bundles.append(generator.generate(step, pipeline_graph))
+
+    if artifact_errors:
+        raise DeploymentArtifactValidationError(
+            "Persisted codegen runtime artifact validation failed",
+            artifact_errors,
+        )
 
     deterministic_dockerfiles = [
         bundle.dockerfile_artifact()
@@ -132,7 +157,7 @@ async def generate_dockerfiles_with_agent(
         for index, step in enumerate(steps)
     }
     dockerfiles = sorted(
-        [*deterministic_dockerfiles, *generic_dockerfiles],
+        [*codegen_dockerfiles, *deterministic_dockerfiles, *generic_dockerfiles],
         key=lambda item: step_order.get(str(item.get("flow_id") or ""), len(steps)),
     )
     validate_dockerfile_artifacts(
@@ -143,12 +168,16 @@ async def generate_dockerfiles_with_agent(
     artifact_payload = {
         "dockerfiles": dockerfiles,
         "runtime_artifacts": [
-            bundle.to_dict(include_content=True)
-            for bundle in deterministic_bundles
+            *codegen_runtime_artifacts,
+            *[
+                bundle.to_dict(include_content=True)
+                for bundle in deterministic_bundles
+            ],
         ],
         "guardrails": {
             "valid": True,
             "checks": [
+                "persisted codegen runtime artifacts were reused before Dockerfile fallback",
                 "registered node generators bypassed the LLM",
                 "generic nodes used the existing guarded LLM path",
                 "one validated Dockerfile was produced per executable pipeline step",
@@ -160,6 +189,165 @@ async def generate_dockerfiles_with_agent(
     if hasattr(ListDockerfilesResponse, "model_validate"):
         return ListDockerfilesResponse.model_validate(artifact_payload)
     return ListDockerfilesResponse.parse_obj(artifact_payload)
+
+
+def _codegen_artifact_for_step(step: dict[str, Any]) -> dict[str, Any] | None:
+    artifact = step.get("generated_artifact")
+    if not isinstance(artifact, dict):
+        return None
+    generator = str(artifact.get("generator") or "").strip()
+    if generator != CODEGEN_GENERATOR:
+        return None
+    return artifact
+
+
+def _codegen_artifact_ready_errors(step: dict[str, Any], artifact: dict[str, Any]) -> list[str]:
+    flow_id = str(step.get("flow_id") or "").strip()
+    errors: list[str] = []
+    status = str(artifact.get("status") or "current").strip().lower()
+    if status != "current":
+        errors.append(f"Node {flow_id} codegen runtime artifact is {status or 'not current'}.")
+
+    validation_report = artifact.get("validation_report")
+    if isinstance(validation_report, dict):
+        validation_status = str(validation_report.get("status") or "").strip().lower()
+        if validation_status == "invalid":
+            errors.append(f"Node {flow_id} codegen runtime artifact is invalid.")
+
+    files = artifact.get("files")
+    if not isinstance(files, list) or not files:
+        errors.append(f"Node {flow_id} codegen runtime artifact has no persisted files.")
+        return errors
+
+    filenames = {
+        str(item.get("filename") or "").strip()
+        for item in files
+        if isinstance(item, dict)
+    }
+    for required in ("main.py", "requirements.txt", "node-manifest.json"):
+        if required not in filenames:
+            errors.append(f"Node {flow_id} codegen runtime artifact is missing {required}.")
+    if not any(name.startswith("Dockerfile.") for name in filenames):
+        errors.append(f"Node {flow_id} codegen runtime artifact is missing Dockerfile.{flow_id}.")
+    return errors
+
+
+def _codegen_image_reference(flow_id: str, artifact: dict[str, Any]) -> str:
+    image = str(artifact.get("image_reference") or artifact.get("image") or "").strip()
+    if image:
+        return image
+    configuration_hash = str(artifact.get("configuration_hash") or "").strip()
+    try:
+        from generators.base import node_image_reference
+
+        return node_image_reference(flow_id, configuration_hash, prefix="codegen")
+    except Exception:
+        return f"inlumen/{_argo_name(flow_id)}:latest"
+
+
+async def _read_persisted_codegen_artifact(
+    step: dict[str, Any],
+    artifact: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    flow_id = str(step.get("flow_id") or "").strip()
+    errors = _codegen_artifact_ready_errors(step, artifact)
+    if errors:
+        raise DeploymentArtifactValidationError(
+            "Persisted codegen runtime artifact validation failed",
+            errors,
+        )
+
+    retrieved_files: list[dict[str, Any]] = []
+    for item in artifact.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("filename") or "").strip()
+        bucket = str(item.get("bucket") or f"files-step-id-{flow_id}").strip().lower()
+        read_bucket = str(item.get("snapshot_bucket") or bucket).strip().lower()
+        read_object = str(item.get("snapshot_object") or filename).strip()
+        if not filename or not read_bucket or not read_object:
+            continue
+        content = item.get("content")
+        if not isinstance(content, str):
+            try:
+                content = await read_minio_object(read_bucket, read_object)
+            except Exception as exc:
+                raise DeploymentArtifactValidationError(
+                    "Persisted codegen runtime artifact validation failed",
+                    [f"Node {flow_id} failed to read {filename} from {read_bucket}: {exc}"],
+                ) from exc
+        retrieved_files.append(
+            {
+                "filename": filename,
+                "bucket": bucket,
+                "content": content,
+                "content_type": str(item.get("content_type") or "text/plain"),
+            }
+        )
+
+    dockerfile = next(
+        (item for item in retrieved_files if item["filename"].startswith("Dockerfile.")),
+        None,
+    )
+    if dockerfile is None:
+        raise DeploymentArtifactValidationError(
+            "Persisted codegen runtime artifact validation failed",
+            [f"Node {flow_id} codegen runtime artifact did not include a Dockerfile."],
+        )
+
+    node_manifest: dict[str, Any] = {}
+    manifest_file = next(
+        (item for item in retrieved_files if item["filename"] == "node-manifest.json"),
+        None,
+    )
+    if manifest_file is not None:
+        try:
+            parsed_manifest = json.loads(str(manifest_file.get("content") or "{}"))
+            if isinstance(parsed_manifest, dict):
+                node_manifest = parsed_manifest
+        except json.JSONDecodeError:
+            node_manifest = {}
+
+    entrypoint = artifact.get("entrypoint") or node_manifest.get("entrypoint")
+    if not isinstance(entrypoint, list) or not all(isinstance(item, str) for item in entrypoint):
+        entrypoint = ["python", "/app/main.py"]
+
+    context_files = [
+        item["filename"]
+        for item in retrieved_files
+        if not item["filename"].startswith("Dockerfile.")
+    ]
+    image_reference = _codegen_image_reference(flow_id, artifact)
+    configuration_hash = str(artifact.get("configuration_hash") or "").strip()
+    runtime_artifact = {
+        "flow_id": flow_id,
+        "definition_id": str(step.get("definition_id") or ""),
+        "definition_version": step.get("definition_version") or 1,
+        "generator": str(artifact.get("generator") or CODEGEN_GENERATOR),
+        "generator_version": str(artifact.get("generator_version") or ""),
+        "configuration_hash": configuration_hash,
+        "image_reference": image_reference,
+        "entrypoint": entrypoint,
+        "data_contract": artifact.get("data_contract") if isinstance(artifact.get("data_contract"), dict) else {},
+        "files": retrieved_files,
+        "manifest": node_manifest,
+        "validation_report": artifact.get("validation_report")
+        if isinstance(artifact.get("validation_report"), dict)
+        else {},
+    }
+    dockerfile_artifact = {
+        "dockerfile_filename": dockerfile["filename"],
+        "content": dockerfile["content"],
+        "flow_id": flow_id,
+        "image": image_reference,
+        "command": entrypoint,
+        "files": context_files,
+        "generator": str(artifact.get("generator") or CODEGEN_GENERATOR),
+        "configuration_hash": configuration_hash,
+        "build_manifest": "node-manifest.json",
+        "data_contract": runtime_artifact["data_contract"],
+    }
+    return runtime_artifact, dockerfile_artifact
 
 
 async def _fetch_dockerfile_prompt_files(file_refs: Optional[list[dict]]) -> list[dict[str, str]]:
@@ -266,10 +454,6 @@ async def _generate_dockerfiles_payload_with_llm(
     model_client = select_model_client(llm_config, parallel_tool_calls=False)
     context = _dockerfile_prompt_context(steps, pipeline_graph, file_contents)
     create_kwargs: dict[str, Any] = {}
-    if llm_config.supports_structured_output:
-        create_kwargs["json_output"] = ListDockerfilesResponse
-    elif llm_config.supports_json_output:
-        create_kwargs["json_output"] = True
 
     try:
         result = await model_client.create(

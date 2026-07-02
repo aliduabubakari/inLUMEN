@@ -564,7 +564,7 @@ export function Sidebar({
             <div className="p-4 border rounded-lg border-border">
               <h3 className="text-sm font-medium mb-2">Generate Deployment Artifacts</h3>
               <p className="text-xs text-muted-foreground mb-3">
-                Generates SemT runtime files and Dockerfiles, then builds the Argo Workflow YAML.
+                Builds Dockerfiles and Argo Workflow YAML from the generated runtime scripts.
               </p>
 
               <Button
@@ -610,7 +610,7 @@ export function Sidebar({
 
               {runtimeArtifactDownloads.length > 0 && (
                 <div className="mt-4">
-                  <div className="text-xs font-medium mb-2">SemT Runtime Downloads</div>
+                  <div className="text-xs font-medium mb-2">Runtime Artifact Downloads</div>
                   <div className="space-y-1">
                     {runtimeArtifactDownloads.map((download) => (
                       <a
@@ -630,7 +630,7 @@ export function Sidebar({
                     className="mt-3 w-full"
                     onClick={clearRuntimeArtifactDownloads}
                   >
-                    Clear SemT Runtime Links
+                    Clear Runtime Artifact Links
                   </Button>
                 </div>
               )}
