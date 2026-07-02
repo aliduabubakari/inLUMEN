@@ -9,6 +9,7 @@ from deployment_artifacts import (  # noqa: E402
     DeploymentArtifactValidationError,
     build_argo_workflow_object,
     build_argo_workflow_yaml,
+    build_dagster_project_files,
     build_dockerfile_artifacts,
     extract_pipeline_steps,
     validate_argo_workflow_object,
@@ -514,6 +515,118 @@ class DeploymentArtifactsTest(unittest.TestCase):
                 if item["name"] == "INLUMEN_INPUT_MANIFEST"
             ),
         )
+
+    def test_dagster_project_files_use_persisted_scripts_and_graph_dependencies(self):
+        graph = {
+            "nodes": [
+                {"id": "1", "data": {"label": "Ingestion", "type": "input"}},
+                {"id": "2", "data": {"label": "Preprocessing", "type": "action"}},
+            ],
+            "edges": [{"source": "1", "target": "2"}],
+        }
+        dockerfile_content = "\n".join(
+            [
+                "FROM python:3.11-slim",
+                "WORKDIR /app",
+                'COPY ["requirements.txt", "/app/requirements.txt"]',
+                "RUN pip install --no-cache-dir -r requirements.txt",
+                'COPY ["main.py", "/app/main.py"]',
+                'COPY ["node-manifest.json", "/app/node-manifest.json"]',
+                'CMD ["python", "/app/main.py"]',
+                "",
+            ]
+        )
+        payload = {
+            "dockerfiles": [
+                {
+                    "dockerfile_filename": "Dockerfile.1",
+                    "content": dockerfile_content,
+                    "flow_id": "1",
+                    "image": "inlumen/step-1:latest",
+                    "command": ["python", "/app/main.py"],
+                    "files": ["requirements.txt", "main.py", "node-manifest.json"],
+                    "generator": "inlumen-codegen-service",
+                },
+                {
+                    "dockerfile_filename": "Dockerfile.2",
+                    "content": dockerfile_content,
+                    "flow_id": "2",
+                    "image": "inlumen/step-2:latest",
+                    "command": ["python", "/app/main.py"],
+                    "files": ["requirements.txt", "main.py", "node-manifest.json"],
+                    "generator": "inlumen-codegen-service",
+                },
+            ],
+            "deployment_files": [
+                {
+                    "path": "nodes/1/main.py",
+                    "filename": "main.py",
+                    "flow_id": "1",
+                    "content": "print('ingest')\n",
+                },
+                {
+                    "path": "nodes/1/requirements.txt",
+                    "filename": "requirements.txt",
+                    "flow_id": "1",
+                    "content": "pandas\n",
+                },
+                {
+                    "path": "nodes/1/node-manifest.json",
+                    "filename": "node-manifest.json",
+                    "flow_id": "1",
+                    "content": "{}\n",
+                },
+                {
+                    "path": "nodes/1/vital_signs_short.csv",
+                    "filename": "vital_signs_short.csv",
+                    "flow_id": "1",
+                    "content": "heart_rate\n72\n",
+                },
+                {
+                    "path": "nodes/2/main.py",
+                    "filename": "main.py",
+                    "flow_id": "2",
+                    "content": "print('preprocess')\n",
+                },
+                {
+                    "path": "nodes/2/requirements.txt",
+                    "filename": "requirements.txt",
+                    "flow_id": "2",
+                    "content": "pandas\nnumpy\n",
+                },
+                {
+                    "path": "nodes/2/node-manifest.json",
+                    "filename": "node-manifest.json",
+                    "flow_id": "2",
+                    "content": "{}\n",
+                },
+            ],
+        }
+
+        files = build_dagster_project_files(graph, payload)
+        by_path = {item["path"]: item["content"] for item in files}
+
+        self.assertIn("dagster_project/pyproject.toml", by_path)
+        self.assertIn(
+            "dagster_project/src/inlumen_dagster_project/components/shell_command.py",
+            by_path,
+        )
+        self.assertEqual(
+            "print('ingest')\n",
+            by_path["dagster_project/src/inlumen_dagster_project/scripts/node_1_ingestion/main.py"],
+        )
+        self.assertIn(
+            'upstream_assets:\n    - "node_1_ingestion"',
+            by_path[
+                "dagster_project/src/inlumen_dagster_project/defs/node_2_preprocessing/defs.yaml"
+            ],
+        )
+        self.assertIn(
+            '"filename": "vital_signs_short.csv"',
+            by_path["dagster_project/storage/inputs/input_manifest.json"],
+        )
+        self.assertIn("pandas", by_path["dagster_project/pyproject.toml"])
+        self.assertIn("numpy", by_path["dagster_project/pyproject.toml"])
 
     def test_argo_guardrail_requires_dockerfile_for_each_step(self):
         dockerfiles = build_dockerfile_artifacts(self.graph)

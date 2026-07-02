@@ -9,7 +9,7 @@ from flask import Flask, jsonify, has_request_context, make_response, request
 from async_runtime import run_async
 from auth_middleware import require_auth
 from chat_state import clear_state_from_disk, load_state_from_disk, save_state_to_disk
-from deployment_artifacts import build_argo_workflow_yaml
+from deployment_artifacts import build_argo_workflow_yaml, build_dagster_project_files
 from deployment_agents import (
     generate_argo_yaml_from_graph,
     generate_dockerfiles_with_agent,
@@ -461,6 +461,39 @@ def agentic_generate_yaml():
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         print("[analytics_api.py] Error generating YAML:", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/agentic_generate_dagster", methods=["POST", "OPTIONS"])
+@require_auth
+def agentic_generate_dagster():
+    if request.method == "OPTIONS":
+        return _preflight_response()
+
+    data = request.get_json() or {}
+    dockerfile_json = data.get("dockerfile_json") or data.get("dockerfiles_json")
+
+    try:
+        print("[analytics_api.py] Generating Dagster project with deterministic artifact builder.")
+        pipeline_graph = _pipeline_graph_from_payload_or_backend(data)
+        files = build_dagster_project_files(pipeline_graph, dockerfile_json)
+        return jsonify(
+            {
+                "files": files,
+                "guardrails": {
+                    "valid": True,
+                    "checks": [
+                        "Dagster project generated from persisted runtime artifacts",
+                        "one defs.yaml component instance per executable pipeline step",
+                        "graph edges mapped to Dagster asset dependencies",
+                    ],
+                },
+            }
+        ), 200
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        print("[analytics_api.py] Error generating Dagster project:", exc)
         return jsonify({"error": str(exc)}), 500
 
 

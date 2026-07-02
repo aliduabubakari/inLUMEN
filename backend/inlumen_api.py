@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from flask import Flask, Response, jsonify, make_response, request
 
 from analytics_api import (
+    agentic_generate_dagster,
     agentic_generate_dockerfiles,
     agentic_generate_version_yamls,
     agentic_generate_yaml,
@@ -69,6 +70,12 @@ app.add_url_rule(
     "/agentic_generate_yaml",
     endpoint="agentic_generate_yaml",
     view_func=agentic_generate_yaml,
+    methods=["POST", "OPTIONS"],
+)
+app.add_url_rule(
+    "/agentic_generate_dagster",
+    endpoint="agentic_generate_dagster",
+    view_func=agentic_generate_dagster,
     methods=["POST", "OPTIONS"],
 )
 app.add_url_rule(

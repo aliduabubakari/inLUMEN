@@ -95,6 +95,10 @@ type DockerfileGenerationResponse = {
   deployment_files?: DeploymentBundleFile[];
 };
 
+type DagsterGenerationResponse = {
+  files?: DeploymentBundleFile[];
+};
+
 type DeploymentBundleFile = {
   path?: string;
   filename?: string;
@@ -119,6 +123,7 @@ type DockerfileDownload = { name: string; url: string };
 type RuntimeArtifactDownload = { name: string; url: string };
 type YamlDownload = { name: string; url: string };
 type DeploymentBundleDownload = { name: string; url: string };
+type DeploymentTargets = { argo: boolean; dagster: boolean };
 
 const FAMILY_LABELS: Record<string, string> = {
   core: "Core",
@@ -155,6 +160,10 @@ export function Sidebar({
   const [yamlDownload, setYamlDownload] = useState<YamlDownload | null>(null);
   const [deploymentBundleDownload, setDeploymentBundleDownload] = useState<DeploymentBundleDownload | null>(null);
   const [deploymentError, setDeploymentError] = useState<string>("");
+  const [deploymentTargets, setDeploymentTargets] = useState<DeploymentTargets>({
+    argo: true,
+    dagster: false,
+  });
   const [nodeDefinitions, setNodeDefinitions] = useState<NodeDefinition[]>(
     getFallbackNodeDefinitions,
   );
@@ -278,8 +287,8 @@ export function Sidebar({
 
   const buildDeploymentZip = async (
     files: DeploymentBundleFile[],
-    yamlText: string,
-    yamlName: string,
+    argoWorkflow?: { text: string; name: string },
+    targets?: DeploymentTargets,
   ) => {
     const zip = new JSZip();
     const written = new Set<string>();
@@ -309,14 +318,17 @@ export function Sidebar({
         role: file.role || "runtime",
       };
     });
-    const yamlPath = writeFile(`argo/${sanitizeZipSegment(yamlName, "workflow.yaml")}`, yamlText);
+    const yamlPath = argoWorkflow
+      ? writeFile(`argo/${sanitizeZipSegment(argoWorkflow.name, "workflow.yaml")}`, argoWorkflow.text)
+      : "";
     writeFile(
       "deployment-manifest.json",
       JSON.stringify(
         {
           schema_version: "inlumen.deployment-artifacts@1",
           generated_at: new Date().toISOString(),
-          argo_workflow: yamlPath,
+          targets: targets ?? { argo: Boolean(argoWorkflow), dagster: files.some((file) => file.path?.startsWith("dagster_project/")) },
+          argo_workflow: yamlPath || null,
           files: manifestFiles,
         },
         null,
@@ -354,6 +366,25 @@ export function Sidebar({
     }
 
     return await genRes.json(); // expected: { dockerfiles: [{dockerfile_filename, content}, ...] }
+  };
+
+  const generateDagsterProject = async (
+    dockerfileJson: DockerfileGenerationResponse,
+  ): Promise<DagsterGenerationResponse> => {
+    const dagsterRes = await apiFetch(`${INLUMEN_API_URL}/agentic_generate_dagster`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        dockerfile_json: dockerfileJson,
+      }),
+    });
+
+    if (!dagsterRes.ok) {
+      const errText = await dagsterRes.text().catch(() => "");
+      throw new Error(`Failed to generate Dagster project: ${dagsterRes.status} ${dagsterRes.statusText} ${errText}`);
+    }
+
+    return await dagsterRes.json();
   };
 
   // fetch overview properties when opening Overview tab
@@ -404,6 +435,9 @@ export function Sidebar({
   const handleGenerateDeploymentArtifacts = async () => {
     try {
       setDeploymentError("");
+      if (!deploymentTargets.argo && !deploymentTargets.dagster) {
+        throw new Error("Select at least one deployment target.");
+      }
       setIsGeneratingDeployment(true);
       clearDockerfileDownloads();
       clearRuntimeArtifactDownloads();
@@ -441,8 +475,16 @@ export function Sidebar({
           }),
       );
       const deploymentFiles = deploymentFilesFromResponse(dockerfile_json);
+      let bundledFiles = deploymentFiles;
+      if (deploymentTargets.dagster) {
+        const dagsterProject = await generateDagsterProject(dockerfile_json);
+        bundledFiles = [
+          ...deploymentFiles,
+          ...(Array.isArray(dagsterProject.files) ? dagsterProject.files : []),
+        ];
+      }
       const deploymentRuntimeLinks = deploymentFiles
-        .filter((file) => file.role !== "dockerfile" && file.filename)
+        .filter((file) => file.role !== "dockerfile" && file.filename && !file.path?.startsWith("dagster_project/"))
         .map((file, index) => {
           const blob = new Blob([file.content ?? ""], {
             type: file.content_type || "text/plain;charset=utf-8",
@@ -453,31 +495,45 @@ export function Sidebar({
           };
         });
 
-      const yamlRes = await apiFetch(`${INLUMEN_API_URL}/agentic_generate_yaml`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          dockerfile_json,
-        }),
-      });
+      let argoWorkflow: { text: string; name: string } | undefined;
+      if (deploymentTargets.argo) {
+        const yamlRes = await apiFetch(`${INLUMEN_API_URL}/agentic_generate_yaml`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            dockerfile_json,
+          }),
+        });
 
-      if (!yamlRes.ok) {
-        const errText = await yamlRes.text().catch(() => "");
-        throw new Error(`Failed to generate YAML: ${yamlRes.status} ${yamlRes.statusText} ${errText}`);
+        if (!yamlRes.ok) {
+          const errText = await yamlRes.text().catch(() => "");
+          throw new Error(`Failed to generate YAML: ${yamlRes.status} ${yamlRes.statusText} ${errText}`);
+        }
+
+        argoWorkflow = {
+          text: await yamlRes.text(),
+          name: `ai-pipeline-${Date.now()}.yaml`,
+        };
       }
 
-      const yamlText = await yamlRes.text();
-      const yamlName = `ai-pipeline-${Date.now()}.yaml`;
-      const blob = new Blob([yamlText], { type: "application/x-yaml;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const bundleBlob = await buildDeploymentZip(deploymentFiles, yamlText, yamlName);
+      const yamlDownloadLink = argoWorkflow
+        ? {
+            name: argoWorkflow.name,
+            url: URL.createObjectURL(new Blob([argoWorkflow.text], { type: "application/x-yaml;charset=utf-8" })),
+          }
+        : null;
+      const bundleBlob = await buildDeploymentZip(bundledFiles, argoWorkflow, deploymentTargets);
       const bundleUrl = URL.createObjectURL(bundleBlob);
+      const targetName = [
+        deploymentTargets.argo ? "argo" : "",
+        deploymentTargets.dagster ? "dagster" : "",
+      ].filter(Boolean).join("-");
 
       setDockerfileDownloads(links);
       setRuntimeArtifactDownloads(deploymentRuntimeLinks.length > 0 ? deploymentRuntimeLinks : runtimeLinks);
-      setYamlDownload({ name: yamlName, url });
+      setYamlDownload(yamlDownloadLink);
       setDeploymentBundleDownload({
-        name: `inlumen-deployment-artifacts-${Date.now()}.zip`,
+        name: `inlumen-${targetName || "deployment"}-artifacts-${Date.now()}.zip`,
         url: bundleUrl,
       });
     } catch (e: unknown) {
@@ -719,13 +775,43 @@ export function Sidebar({
             <div className="p-4 border rounded-lg border-border">
               <h3 className="text-sm font-medium mb-2">Generate Deployment Artifacts</h3>
               <p className="text-xs text-muted-foreground mb-3">
-                Builds Dockerfiles and Argo Workflow YAML from the generated runtime scripts.
+                Builds deployment bundles from the generated runtime scripts.
               </p>
+
+              <div className="mb-3 rounded-md border border-border bg-muted/20 p-2">
+                <div className="mb-2 text-xs font-medium">Deployment target</div>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={deploymentTargets.argo}
+                    onChange={(event) =>
+                      setDeploymentTargets((current) => ({
+                        ...current,
+                        argo: event.target.checked,
+                      }))
+                    }
+                  />
+                  <span>Argo Workflow</span>
+                </label>
+                <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={deploymentTargets.dagster}
+                    onChange={(event) =>
+                      setDeploymentTargets((current) => ({
+                        ...current,
+                        dagster: event.target.checked,
+                      }))
+                    }
+                  />
+                  <span>Dagster project</span>
+                </label>
+              </div>
 
               <Button
                 className="h-auto min-h-10 w-full whitespace-normal px-3 py-2 text-center leading-snug"
                 onClick={handleGenerateDeploymentArtifacts}
-                disabled={isGeneratingDeployment}
+                disabled={isGeneratingDeployment || (!deploymentTargets.argo && !deploymentTargets.dagster)}
               >
                 {isGeneratingDeployment ? "Generating..." : "Generate Deployment Artifacts"}
               </Button>
