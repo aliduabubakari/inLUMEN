@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import JSZip from 'jszip';
 import { apiFetch } from '@/utils/apiFetch';
 import { INLUMEN_API_URL } from '@/config/api';
-import { ChatbotConfig, buildLLMRequestConfig } from '@/services/chatbotService';
+import type { ChatbotConfig } from '@/services/chatbotService';
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
@@ -345,7 +345,6 @@ export function Sidebar({
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         files,
-        llm_config: activeChatbotConfig ? buildLLMRequestConfig(activeChatbotConfig) : undefined,
       }),
     });
 
@@ -459,7 +458,6 @@ export function Sidebar({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           dockerfile_json,
-          llm_config: activeChatbotConfig ? buildLLMRequestConfig(activeChatbotConfig) : undefined,
         }),
       });
 

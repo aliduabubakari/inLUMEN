@@ -460,6 +460,61 @@ class DeploymentArtifactsTest(unittest.TestCase):
         self.assertIn('generateName: "inlumen-codegen-"', yaml_text)
         self.assertIn('artifactRepositoryRef:', yaml_text)
 
+    def test_codegen_dockerfile_payload_selects_manifest_handoff_without_node_metadata(self):
+        graph = {
+            "nodes": [
+                {"id": "1", "data": {"label": "Ingestion", "type": "input"}},
+                {"id": "2", "data": {"label": "Preprocessing", "type": "action"}},
+            ],
+            "edges": [{"source": "1", "target": "2"}],
+        }
+        dockerfile_content = "\n".join(
+            [
+                "FROM python:3.11-slim",
+                "WORKDIR /app",
+                'COPY ["requirements.txt", "/app/requirements.txt"]',
+                "RUN pip install --no-cache-dir -r requirements.txt",
+                'COPY ["main.py", "/app/main.py"]',
+                'COPY ["node-manifest.json", "/app/node-manifest.json"]',
+                'CMD ["python", "/app/main.py"]',
+                "",
+            ]
+        )
+        dockerfiles = {
+            "dockerfiles": [
+                {
+                    "dockerfile_filename": "Dockerfile.1",
+                    "content": dockerfile_content,
+                    "flow_id": "1",
+                    "image": "inlumen/step-1:latest",
+                    "command": ["python", "/app/main.py"],
+                    "files": ["requirements.txt", "main.py", "node-manifest.json"],
+                    "generator": "inlumen-codegen-service",
+                },
+                {
+                    "dockerfile_filename": "Dockerfile.2",
+                    "content": dockerfile_content,
+                    "flow_id": "2",
+                    "image": "inlumen/step-2:latest",
+                    "command": ["python", "/app/main.py"],
+                    "files": ["requirements.txt", "main.py", "node-manifest.json"],
+                    "generator": "inlumen-codegen-service",
+                },
+            ]
+        }
+
+        workflow = build_argo_workflow_object(graph, dockerfiles)
+
+        self.assertEqual("inlumen-codegen-", workflow["metadata"]["generateName"])
+        self.assertEqual(
+            "/inlumen/inputs/input_manifest.json",
+            next(
+                item["value"]
+                for item in workflow["spec"]["templates"][1]["container"]["env"]
+                if item["name"] == "INLUMEN_INPUT_MANIFEST"
+            ),
+        )
+
     def test_argo_guardrail_requires_dockerfile_for_each_step(self):
         dockerfiles = build_dockerfile_artifacts(self.graph)
         dockerfiles["dockerfiles"] = dockerfiles["dockerfiles"][:2]

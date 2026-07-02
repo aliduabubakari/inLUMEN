@@ -727,6 +727,21 @@ def _is_current_codegen_step(step: dict) -> bool:
     return (_clean_string(artifact.get("status")) or "current").lower() == "current"
 
 
+def _is_codegen_dockerfile_payload(
+    step_ids: Sequence[str],
+    dockerfiles_by_step: Dict[str, dict],
+) -> bool:
+    if not step_ids:
+        return False
+    for step_id in step_ids:
+        dockerfile = dockerfiles_by_step.get(step_id)
+        if not isinstance(dockerfile, dict):
+            return False
+        if _clean_string(dockerfile.get("generator")) != CODEGEN_GENERATOR:
+            return False
+    return True
+
+
 def _step_data_contract(step: dict) -> dict:
     artifact = step.get("generated_artifact")
     if not isinstance(artifact, dict):
@@ -1234,7 +1249,10 @@ def build_argo_workflow_object(
         validate_argo_workflow_object(workflow, step_ids)
         return workflow
 
-    if steps and all(_is_current_codegen_step(step) for step in steps):
+    if steps and (
+        all(_is_current_codegen_step(step) for step in steps)
+        or _is_codegen_dockerfile_payload(step_ids, dockerfiles_by_step)
+    ):
         workflow = _build_codegen_argo_workflow_object(
             steps=steps,
             ordered_ids=ordered_ids,

@@ -78,6 +78,8 @@ async def generate_dockerfiles_with_agent(
     artifact_errors: list[str] = []
     for step in steps:
         codegen_artifact = _codegen_artifact_for_step(step)
+        if codegen_artifact is None:
+            codegen_artifact = _codegen_artifact_from_persisted_files(step)
         if codegen_artifact is not None:
             try:
                 runtime_artifact, dockerfile = await _read_persisted_codegen_artifact(
@@ -261,6 +263,26 @@ def _deployment_files_from_artifacts(
     return files
 
 
+def _codegen_artifact_from_persisted_files(step: dict[str, Any]) -> dict[str, Any] | None:
+    files = step.get("files") if isinstance(step.get("files"), list) else []
+    filenames = {
+        str(item.get("filename") or "").strip()
+        for item in files
+        if isinstance(item, dict)
+    }
+    has_runtime_files = all(
+        required in filenames
+        for required in ("main.py", "requirements.txt", "node-manifest.json")
+    ) and any(name.startswith("Dockerfile.") for name in filenames)
+    if not has_runtime_files:
+        return None
+    return {
+        "status": "current",
+        "generator": CODEGEN_GENERATOR,
+        "files": files,
+    }
+
+
 def _codegen_artifact_for_step(step: dict[str, Any]) -> dict[str, Any] | None:
     artifact = step.get("generated_artifact")
     if not isinstance(artifact, dict):
@@ -378,6 +400,21 @@ async def _read_persisted_codegen_artifact(
         except json.JSONDecodeError:
             node_manifest = {}
 
+    validation_report = artifact.get("validation_report")
+    if not isinstance(validation_report, dict):
+        validation_report = {}
+        validation_file = next(
+            (item for item in retrieved_files if item["filename"] == "validation-report.json"),
+            None,
+        )
+        if validation_file is not None:
+            try:
+                parsed_report = json.loads(str(validation_file.get("content") or "{}"))
+                if isinstance(parsed_report, dict):
+                    validation_report = parsed_report
+            except json.JSONDecodeError:
+                validation_report = {}
+
     entrypoint = artifact.get("entrypoint") or node_manifest.get("entrypoint")
     if not isinstance(entrypoint, list) or not all(isinstance(item, str) for item in entrypoint):
         entrypoint = ["python", "/app/main.py"]
@@ -398,12 +435,16 @@ async def _read_persisted_codegen_artifact(
         "configuration_hash": configuration_hash,
         "image_reference": image_reference,
         "entrypoint": entrypoint,
-        "data_contract": artifact.get("data_contract") if isinstance(artifact.get("data_contract"), dict) else {},
+        "data_contract": (
+            artifact.get("data_contract")
+            if isinstance(artifact.get("data_contract"), dict)
+            else node_manifest.get("data_contract")
+            if isinstance(node_manifest.get("data_contract"), dict)
+            else {}
+        ),
         "files": retrieved_files,
         "manifest": node_manifest,
-        "validation_report": artifact.get("validation_report")
-        if isinstance(artifact.get("validation_report"), dict)
-        else {},
+        "validation_report": validation_report,
     }
     dockerfile_artifact = {
         "dockerfile_filename": dockerfile["filename"],
