@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import JSZip from 'jszip';
 import { apiFetch } from '@/utils/apiFetch';
 import { INLUMEN_API_URL } from '@/config/api';
 import { ChatbotConfig, buildLLMRequestConfig } from '@/services/chatbotService';
@@ -81,6 +82,7 @@ type DockerfileGenerationResponse = {
   dockerfiles?: Array<{
     dockerfile_filename?: string;
     content?: string;
+    flow_id?: string;
   }>;
   runtime_artifacts?: Array<{
     flow_id?: string;
@@ -90,6 +92,16 @@ type DockerfileGenerationResponse = {
       content_type?: string;
     }>;
   }>;
+  deployment_files?: DeploymentBundleFile[];
+};
+
+type DeploymentBundleFile = {
+  path?: string;
+  filename?: string;
+  flow_id?: string;
+  content?: string;
+  content_type?: string;
+  role?: string;
 };
 
 type PipelineOverviewResponse = {
@@ -106,6 +118,7 @@ const errorToMessage = (error: unknown, fallback: string) =>
 type DockerfileDownload = { name: string; url: string };
 type RuntimeArtifactDownload = { name: string; url: string };
 type YamlDownload = { name: string; url: string };
+type DeploymentBundleDownload = { name: string; url: string };
 
 const FAMILY_LABELS: Record<string, string> = {
   core: "Core",
@@ -140,6 +153,7 @@ export function Sidebar({
   const [dockerfileDownloads, setDockerfileDownloads] = useState<DockerfileDownload[]>([]);
   const [runtimeArtifactDownloads, setRuntimeArtifactDownloads] = useState<RuntimeArtifactDownload[]>([]);
   const [yamlDownload, setYamlDownload] = useState<YamlDownload | null>(null);
+  const [deploymentBundleDownload, setDeploymentBundleDownload] = useState<DeploymentBundleDownload | null>(null);
   const [deploymentError, setDeploymentError] = useState<string>("");
   const [nodeDefinitions, setNodeDefinitions] = useState<NodeDefinition[]>(
     getFallbackNodeDefinitions,
@@ -168,7 +182,9 @@ export function Sidebar({
   useEffect(() => {
     return () => {
       dockerfileDownloads.forEach((d) => URL.revokeObjectURL(d.url));
+      runtimeArtifactDownloads.forEach((d) => URL.revokeObjectURL(d.url));
       if (yamlDownload?.url) URL.revokeObjectURL(yamlDownload.url);
+      if (deploymentBundleDownload?.url) URL.revokeObjectURL(deploymentBundleDownload.url);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -191,6 +207,126 @@ export function Sidebar({
     setYamlDownload((prev) => {
       if (prev?.url) URL.revokeObjectURL(prev.url);
       return null;
+    });
+  };
+
+  const clearDeploymentBundleDownload = () => {
+    setDeploymentBundleDownload((prev) => {
+      if (prev?.url) URL.revokeObjectURL(prev.url);
+      return null;
+    });
+  };
+
+  const sanitizeZipSegment = (value: unknown, fallback: string) => {
+    const cleaned = String(value || "")
+      .trim()
+      .replace(/[^A-Za-z0-9_.-]+/g, "-")
+      .replace(/^[-.]+|[-.]+$/g, "");
+    return cleaned || fallback;
+  };
+
+  const safeZipPath = (file: DeploymentBundleFile, index: number) => {
+    const rawPath = String(file.path || "").trim();
+    if (rawPath) {
+      const parts = rawPath
+        .split("/")
+        .map((part) => sanitizeZipSegment(part, "file"))
+        .filter((part) => part && part !== "." && part !== "..");
+      if (parts.length > 0) return parts.join("/");
+    }
+    const flowId = sanitizeZipSegment(file.flow_id, "node");
+    const filename = sanitizeZipSegment(file.filename, `artifact-${index + 1}.txt`);
+    return `nodes/${flowId}/${filename}`;
+  };
+
+  const fallbackDeploymentFiles = (
+    payload: DockerfileGenerationResponse,
+  ): DeploymentBundleFile[] => {
+    const runtimeFiles = (payload.runtime_artifacts ?? []).flatMap((artifact) =>
+      (artifact.files ?? []).map((file) => ({
+        path: `nodes/${sanitizeZipSegment(artifact.flow_id, "node")}/${file.filename || "artifact.txt"}`,
+        filename: file.filename,
+        flow_id: artifact.flow_id,
+        content: file.content ?? "",
+        content_type: file.content_type,
+        role: file.filename?.startsWith("Dockerfile.") ? "dockerfile" : "runtime",
+      })),
+    );
+    const dockerfiles = (payload.dockerfiles ?? []).map((dockerfile, index) => ({
+      path: `nodes/${sanitizeZipSegment(dockerfile.flow_id, `node-${index + 1}`)}/${dockerfile.dockerfile_filename || `Dockerfile.${index + 1}`}`,
+      filename: dockerfile.dockerfile_filename || `Dockerfile.${index + 1}`,
+      flow_id: dockerfile.flow_id,
+      content: dockerfile.content ?? "",
+      content_type: "text/x-dockerfile",
+      role: "dockerfile",
+    }));
+    const byPath = new Map<string, DeploymentBundleFile>();
+    [...runtimeFiles, ...dockerfiles].forEach((file, index) => {
+      byPath.set(safeZipPath(file, index), file);
+    });
+    return [...byPath.values()];
+  };
+
+  const deploymentFilesFromResponse = (
+    payload: DockerfileGenerationResponse,
+  ): DeploymentBundleFile[] => {
+    const files = Array.isArray(payload.deployment_files)
+      ? payload.deployment_files
+      : [];
+    return files.length > 0 ? files : fallbackDeploymentFiles(payload);
+  };
+
+  const buildDeploymentZip = async (
+    files: DeploymentBundleFile[],
+    yamlText: string,
+    yamlName: string,
+  ) => {
+    const zip = new JSZip();
+    const written = new Set<string>();
+    const writeFile = (path: string, content: string) => {
+      let nextPath = path;
+      let suffix = 2;
+      while (written.has(nextPath)) {
+        const dot = path.lastIndexOf(".");
+        nextPath = dot > 0
+          ? `${path.slice(0, dot)}-${suffix}${path.slice(dot)}`
+          : `${path}-${suffix}`;
+        suffix += 1;
+      }
+      written.add(nextPath);
+      zip.file(nextPath, content);
+      return nextPath;
+    };
+
+    const manifestFiles = files.map((file, index) => {
+      const path = safeZipPath(file, index);
+      const zipPath = writeFile(path, file.content ?? "");
+      return {
+        path: zipPath,
+        filename: file.filename || zipPath.split("/").pop() || "",
+        flow_id: file.flow_id || "",
+        content_type: file.content_type || "text/plain",
+        role: file.role || "runtime",
+      };
+    });
+    const yamlPath = writeFile(`argo/${sanitizeZipSegment(yamlName, "workflow.yaml")}`, yamlText);
+    writeFile(
+      "deployment-manifest.json",
+      JSON.stringify(
+        {
+          schema_version: "inlumen.deployment-artifacts@1",
+          generated_at: new Date().toISOString(),
+          argo_workflow: yamlPath,
+          files: manifestFiles,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+
+    return zip.generateAsync({
+      type: "blob",
+      compression: "DEFLATE",
     });
   };
 
@@ -273,6 +409,7 @@ export function Sidebar({
       clearDockerfileDownloads();
       clearRuntimeArtifactDownloads();
       clearYamlDownload();
+      clearDeploymentBundleDownload();
 
       const files = await fetchBackendFiles();
       const dockerfile_json = await generateDockerfiles(files);
@@ -304,6 +441,18 @@ export function Sidebar({
             };
           }),
       );
+      const deploymentFiles = deploymentFilesFromResponse(dockerfile_json);
+      const deploymentRuntimeLinks = deploymentFiles
+        .filter((file) => file.role !== "dockerfile" && file.filename)
+        .map((file, index) => {
+          const blob = new Blob([file.content ?? ""], {
+            type: file.content_type || "text/plain;charset=utf-8",
+          });
+          return {
+            name: safeZipPath(file, index).replace(/\//g, "__"),
+            url: URL.createObjectURL(blob),
+          };
+        });
 
       const yamlRes = await apiFetch(`${INLUMEN_API_URL}/agentic_generate_yaml`, {
         method: "POST",
@@ -320,15 +469,23 @@ export function Sidebar({
       }
 
       const yamlText = await yamlRes.text();
+      const yamlName = `ai-pipeline-${Date.now()}.yaml`;
       const blob = new Blob([yamlText], { type: "application/x-yaml;charset=utf-8" });
       const url = URL.createObjectURL(blob);
+      const bundleBlob = await buildDeploymentZip(deploymentFiles, yamlText, yamlName);
+      const bundleUrl = URL.createObjectURL(bundleBlob);
 
       setDockerfileDownloads(links);
-      setRuntimeArtifactDownloads(runtimeLinks);
-      setYamlDownload({ name: `ai-pipeline-${Date.now()}.yaml`, url });
+      setRuntimeArtifactDownloads(deploymentRuntimeLinks.length > 0 ? deploymentRuntimeLinks : runtimeLinks);
+      setYamlDownload({ name: yamlName, url });
+      setDeploymentBundleDownload({
+        name: `inlumen-deployment-artifacts-${Date.now()}.zip`,
+        url: bundleUrl,
+      });
     } catch (e: unknown) {
       clearDockerfileDownloads();
       clearRuntimeArtifactDownloads();
+      clearDeploymentBundleDownload();
       console.error("[Sidebar.tsx] Generate deployment artifacts error:", e);
       setDeploymentError(errorToMessage(e, "Failed to generate deployment artifacts."));
     } finally {
@@ -578,6 +735,28 @@ export function Sidebar({
               {deploymentError && (
                 <div className="mt-3 text-xs text-red-400">
                   {deploymentError}
+                </div>
+              )}
+
+              {deploymentBundleDownload && (
+                <div className="mt-4">
+                  <div className="text-xs font-medium mb-2">Deployment Bundle</div>
+                  <a
+                    href={deploymentBundleDownload.url}
+                    download={deploymentBundleDownload.name}
+                    className="flex items-center gap-2 text-xs underline"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span className="truncate">{deploymentBundleDownload.name}</span>
+                  </a>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="mt-3 w-full"
+                    onClick={clearDeploymentBundleDownload}
+                  >
+                    Clear Bundle Link
+                  </Button>
                 </div>
               )}
 

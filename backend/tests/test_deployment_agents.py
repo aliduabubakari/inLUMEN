@@ -105,6 +105,16 @@ class DeploymentAgentsTest(unittest.TestCase):
             "persisted codegen runtime artifacts were reused before Dockerfile fallback",
             result["guardrails"]["checks"],
         )
+        self.assertEqual(
+            {
+                "nodes/1/Dockerfile.1",
+                "nodes/1/main.py",
+                "nodes/1/node-manifest.json",
+                "nodes/1/requirements.txt",
+                "nodes/1/validation-report.json",
+            },
+            {item["path"] for item in result["deployment_files"]},
+        )
 
 
 if __name__ == "__main__":

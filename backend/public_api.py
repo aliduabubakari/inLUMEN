@@ -1411,6 +1411,10 @@ def build_openapi_schema() -> dict[str, Any]:
                             "type": "array",
                             "items": {"type": "object"},
                         },
+                        "deployment_files": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                        },
                         "guardrails": {
                             "type": "object",
                             "properties": {

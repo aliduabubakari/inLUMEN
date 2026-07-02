@@ -41,6 +41,7 @@ class ListDockerfilesResponse(BaseModel):
 
     dockerfiles: list[DockerfileItem]
     runtime_artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    deployment_files: list[dict[str, Any]] = Field(default_factory=list)
     guardrails: Optional[GuardrailReport] = None
 
 
@@ -165,15 +166,20 @@ async def generate_dockerfiles_with_agent(
         [step["flow_id"] for step in steps],
         steps,
     )
+    runtime_artifacts = [
+        *codegen_runtime_artifacts,
+        *[
+            bundle.to_dict(include_content=True)
+            for bundle in deterministic_bundles
+        ],
+    ]
     artifact_payload = {
         "dockerfiles": dockerfiles,
-        "runtime_artifacts": [
-            *codegen_runtime_artifacts,
-            *[
-                bundle.to_dict(include_content=True)
-                for bundle in deterministic_bundles
-            ],
-        ],
+        "runtime_artifacts": runtime_artifacts,
+        "deployment_files": _deployment_files_from_artifacts(
+            dockerfiles,
+            runtime_artifacts,
+        ),
         "guardrails": {
             "valid": True,
             "checks": [
@@ -189,6 +195,70 @@ async def generate_dockerfiles_with_agent(
     if hasattr(ListDockerfilesResponse, "model_validate"):
         return ListDockerfilesResponse.model_validate(artifact_payload)
     return ListDockerfilesResponse.parse_obj(artifact_payload)
+
+
+def _deployment_files_from_artifacts(
+    dockerfiles: list[dict[str, Any]],
+    runtime_artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    def add_file(
+        *,
+        flow_id: str,
+        filename: str,
+        content: Any,
+        content_type: str = "text/plain",
+        role: str = "runtime",
+    ) -> None:
+        clean_filename = str(filename or "").strip()
+        if not clean_filename:
+            return
+        node_dir = _sanitize_fragment(flow_id or "pipeline", "node")
+        path = f"nodes/{node_dir}/{clean_filename}"
+        if path in seen_paths:
+            return
+        seen_paths.add(path)
+        files.append(
+            {
+                "path": path,
+                "filename": clean_filename,
+                "flow_id": str(flow_id or ""),
+                "content": str(content or ""),
+                "content_type": content_type,
+                "role": role,
+            }
+        )
+
+    for artifact in runtime_artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        flow_id = str(artifact.get("flow_id") or "").strip()
+        for file_item in artifact.get("files") or []:
+            if not isinstance(file_item, dict):
+                continue
+            filename = str(file_item.get("filename") or "").strip()
+            add_file(
+                flow_id=flow_id,
+                filename=filename,
+                content=file_item.get("content"),
+                content_type=str(file_item.get("content_type") or "text/plain"),
+                role="dockerfile" if filename.startswith("Dockerfile.") else "runtime",
+            )
+
+    for dockerfile in dockerfiles:
+        if not isinstance(dockerfile, dict):
+            continue
+        add_file(
+            flow_id=str(dockerfile.get("flow_id") or ""),
+            filename=str(dockerfile.get("dockerfile_filename") or ""),
+            content=dockerfile.get("content"),
+            content_type="text/x-dockerfile",
+            role="dockerfile",
+        )
+
+    return files
 
 
 def _codegen_artifact_for_step(step: dict[str, Any]) -> dict[str, Any] | None:
