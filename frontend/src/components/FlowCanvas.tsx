@@ -36,6 +36,8 @@ import {
   updateNodePositionInBackend,
   clearBackendGraph,
 } from '@/features/flow/flowPersistence';
+import { uploadNodeFile } from '@/features/nodes/nodePersistence';
+import { normalizeType, typeHasFiles } from '@/features/nodes/nodeSchema';
 import {
   createAgentGraphSnapshot,
   downloadJsonFile,
@@ -99,6 +101,12 @@ const getSnapshotFileRef = (file: unknown, nodeIdValue: string) => {
   return null;
 };
 
+const getSnapshotFileName = (file: unknown, nodeIdValue: string) => {
+  const ref = getSnapshotFileRef(file, nodeIdValue);
+  if (typeof ref === "string") return ref;
+  return ref?.filename ?? "";
+};
+
 const GRAPH_HISTORY_LIMIT = 25;
 const GRAPH_HISTORY_COALESCE_MS = 1200;
 
@@ -131,6 +139,11 @@ const normalizeViewport = (viewport: unknown): GraphViewport => {
     zoom: Number.isFinite(Number(candidate.zoom)) ? Number(candidate.zoom) : 1,
   };
 };
+
+const uploadedFileReference = (nodeIdValue: string, fileName: string) => ({
+  filename: fileName,
+  bucket: `files-step-id-${nodeIdValue}`.toLowerCase(),
+});
 
 const normalizeForHistorySignature = (value: unknown): unknown => {
   if (typeof File !== "undefined" && value instanceof File) {
@@ -860,10 +873,74 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
       ?? data;
   };
 
+  const importPythonScript = async (file: File) => {
+    if (!selectedNode) {
+      toast.error('Select a node first', {
+        description: 'Python scripts are attached to the currently selected node.',
+      });
+      return;
+    }
+
+    const nodeTypeForFiles = normalizeType(selectedNode.data?.type ?? selectedNode.type);
+    if (!typeHasFiles(nodeTypeForFiles)) {
+      toast.error('Selected node cannot accept scripts', {
+        description: 'Choose an input, action, output, or custom node before importing a Python script.',
+      });
+      return;
+    }
+
+    await uploadNodeFile(selectedNode.id, file);
+    const existingFiles = Array.isArray(selectedNode.data?.files)
+      ? selectedNode.data.files
+      : [];
+    const uploadedRef = uploadedFileReference(selectedNode.id, file.name);
+    const nextFiles = [
+      ...existingFiles.filter((entry) => getSnapshotFileName(entry, selectedNode.id) !== file.name),
+      uploadedRef,
+    ];
+    const nextData = {
+      ...selectedNode.data,
+      type: nodeTypeForFiles,
+      files: nextFiles,
+      has_files: 'yes',
+    };
+
+    pushHistorySnapshot();
+    onCanvasEdited?.();
+    markLocalWrite(1200);
+    setNodes((currentNodes) =>
+      currentNodes.map((node) => (
+        node.id === selectedNode.id
+          ? { ...node, data: nextData }
+          : node
+      ))
+    );
+    setSelectedNode((currentSelected) => (
+      currentSelected?.id === selectedNode.id
+        ? { ...currentSelected, data: nextData }
+        : currentSelected
+    ));
+    onNodeSelect({ ...selectedNode, data: nextData }, { openInspector: false });
+    toast.success('Python script imported', {
+      description: `${file.name} was attached to ${selectedNode.data?.label || `Node ${selectedNode.id}`}.`,
+    });
+  };
+
   const importFlow = async (e: React.ChangeEvent<HTMLInputElement>) => {
     try {
       const file = e.target.files?.[0];
       if (!file) return;
+      const lowerName = file.name.toLowerCase();
+      if (lowerName.endsWith('.py')) {
+        await importPythonScript(file);
+        return;
+      }
+      if (!lowerName.endsWith('.json')) {
+        toast.error('Unsupported import file', {
+          description: 'Use JSON for pipeline imports or Python files for node scripts.',
+        });
+        return;
+      }
       const text = await file.text();
       const parsed = JSON.parse(text);
       const graphCandidate = extractImportGraph(parsed);

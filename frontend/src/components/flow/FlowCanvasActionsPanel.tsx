@@ -80,7 +80,7 @@ export const FlowCanvasActionsPanel = ({
       <input
         ref={fileInputRef}
         type="file"
-        accept=".json,application/json"
+        accept=".json,application/json,.py,text/x-python,text/x-script.python"
         className="hidden"
         onChange={onImport}
       />
