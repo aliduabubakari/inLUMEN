@@ -59,21 +59,63 @@ export const normalizeGraph = (data: unknown): NormalizedGraph => {
   const incomingEdges = Array.isArray(parsedGraph.edges) ? parsedGraph.edges : [];
 
   const nodes: Node[] = incomingNodes.flatMap((nodeEntry) => {
-    const node = (nodeEntry && typeof nodeEntry === "object" ? nodeEntry : {}) as Node;
-    if (node.id == null || String(node.id).trim() === "") return [];
-    const position = node.position || { x: 0, y: 0 };
+    const node = (nodeEntry && typeof nodeEntry === "object" ? nodeEntry : {}) as Node & {
+      flow_id?: unknown;
+      label?: unknown;
+      description?: unknown;
+      content?: unknown;
+      endpoint?: unknown;
+      database?: unknown;
+      files?: unknown;
+      param?: unknown;
+      definition_id?: unknown;
+      definition_version?: unknown;
+      implementation?: unknown;
+      configuration_status?: unknown;
+      generated_artifact?: unknown;
+      x?: unknown;
+      y?: unknown;
+    };
+    const id = node.id ?? node.flow_id;
+    if (id == null || String(id).trim() === "") return [];
+    const position = node.position || { x: node.x, y: node.y };
+    const data = node.data && typeof node.data === "object" ? node.data : {};
+    const nodeType = normalizeType(data.type ?? node.type);
     return [{
       ...node,
-      id: String(node.id),
+      id: String(id),
+      type: "custom",
       position: {
         x: Number.isFinite(Number(position.x)) ? Number(position.x) : 0,
         y: Number.isFinite(Number(position.y)) ? Number(position.y) : 0,
       },
       data: {
-        ...node.data,
-        label: node.data?.label || "",
-        description: node.data?.description || "",
-        type: normalizeType(node.data?.type),
+        ...data,
+        label: data.label || node.label || "",
+        description: data.description || node.description || "",
+        type: nodeType,
+        ...(typeof data.content === "string" || typeof node.content === "string"
+          ? { content: data.content ?? node.content }
+          : {}),
+        ...(typeof data.endpoint === "string" || typeof node.endpoint === "string"
+          ? { endpoint: data.endpoint ?? node.endpoint }
+          : {}),
+        ...(typeof data.database === "string" || typeof node.database === "string"
+          ? { database: data.database ?? node.database }
+          : {}),
+        ...(Array.isArray(data.files) || Array.isArray(node.files)
+          ? { files: data.files ?? node.files }
+          : {}),
+        ...(data.param && typeof data.param === "object" && !Array.isArray(data.param)
+          ? { param: data.param }
+          : node.param && typeof node.param === "object" && !Array.isArray(node.param)
+            ? { param: node.param }
+            : {}),
+        ...(data.definition_id || node.definition_id ? { definition_id: data.definition_id ?? node.definition_id } : {}),
+        ...(data.definition_version || node.definition_version ? { definition_version: data.definition_version ?? node.definition_version } : {}),
+        ...(data.implementation || node.implementation ? { implementation: data.implementation ?? node.implementation } : {}),
+        ...(data.configuration_status || node.configuration_status ? { configuration_status: data.configuration_status ?? node.configuration_status } : {}),
+        ...(data.generated_artifact || node.generated_artifact ? { generated_artifact: data.generated_artifact ?? node.generated_artifact } : {}),
       },
     }];
   });

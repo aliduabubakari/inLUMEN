@@ -843,34 +843,60 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
     }
   };
 
+  const extractImportGraph = (data: unknown): unknown => {
+    if (!data || typeof data !== "object") return data;
+    const candidate = data as {
+      graph?: unknown;
+      flow?: unknown;
+      workflow?: unknown;
+      version?: { graph?: unknown };
+      pipeline?: { graph?: unknown };
+    };
+    return candidate.graph
+      ?? candidate.flow
+      ?? candidate.workflow
+      ?? candidate.version?.graph
+      ?? candidate.pipeline?.graph
+      ?? data;
+  };
+
   const importFlow = async (e: React.ChangeEvent<HTMLInputElement>) => {
     try {
       const file = e.target.files?.[0];
       if (!file) return;
       const text = await file.text();
-      const flowData = JSON.parse(text) as { nodes?: Node[]; edges?: Edge[] };
-      if (!Array.isArray(flowData.nodes) || !Array.isArray(flowData.edges)) {
+      const parsed = JSON.parse(text);
+      const graphCandidate = extractImportGraph(parsed);
+      const importedGraph = normalizeGraph(graphCandidate);
+      if (importedGraph.nodes.length === 0) {
         toast.error('Invalid flow file', {
-          description: 'The selected file does not contain a valid flow',
+          description: 'The selected file does not contain importable pipeline nodes',
         });
         return;
       }
-      const importedNodes = flowData.nodes;
-      const importedEdges = flowData.edges;
       pushHistorySnapshot();
       onCanvasEdited?.();
       markLocalWrite(1200); // avoid immediate poll-refresh
-      await rebuildBackendFromFlow(importedNodes, importedEdges);
-      setNodes(importedNodes);
-      setEdges(importedEdges);
-      nodeId = getNextNumericNodeId(importedNodes, 1);
+      await rebuildBackendFromFlow(importedGraph.nodes, importedGraph.edges);
+      applyGraph(parsed, importedGraph);
+      selectedNodeIdRef.current = null;
+      setSelectedNode(null);
+      onNodeSelect(null, { openInspector: false });
+      if (reactFlowInstance) {
+        const viewport = graphCandidate && typeof graphCandidate === "object"
+          ? (graphCandidate as { viewport?: unknown }).viewport
+          : null;
+        reactFlowInstance.setViewport(normalizeViewport(viewport));
+      }
       toast.success('Flow imported successfully', {
-        description: 'Imported flow and backend state reconstructed',
+        description: `Imported ${importedGraph.nodes.length} nodes and ${importedGraph.edges.length} edges`,
       });
     } catch (error) {
       console.error('Error importing flow:', error);
       toast.error('Failed to import flow', {
-        description: 'There was an error importing your pipeline',
+        description: error instanceof SyntaxError
+          ? 'The selected file is not valid JSON'
+          : 'There was an error importing your pipeline',
       });
     } finally {
       if (e.target) e.target.value = '';
