@@ -13,8 +13,10 @@ from deployment_artifacts import (
     _sanitize_fragment,
     build_argo_workflow_yaml,
     extract_pipeline_steps,
+    select_runtime_steps,
     validate_dockerfile_artifacts,
 )
+from generators.registry import GeneratorRegistry
 from llm_config import LLMConfig, resolve_llm_config, select_model_client
 from minio_gateway import read_minio_object
 
@@ -27,12 +29,16 @@ class ListDockerfilesResponse(BaseModel):
         image: Optional[str] = None
         command: list[str] = Field(default_factory=list)
         files: list[str] = Field(default_factory=list)
+        generator: Optional[str] = None
+        configuration_hash: Optional[str] = None
+        build_manifest: Optional[str] = None
 
     class GuardrailReport(BaseModel):
         valid: bool
         checks: list[str] = Field(default_factory=list)
 
     dockerfiles: list[DockerfileItem]
+    runtime_artifacts: list[dict[str, Any]] = Field(default_factory=list)
     guardrails: Optional[GuardrailReport] = None
 
 
@@ -43,8 +49,7 @@ async def generate_dockerfiles_with_agent(
     pipeline_graph: Optional[dict] = None,
     file_refs: Optional[list[dict]] = None,
 ) -> ListDockerfilesResponse:
-    """Generate one validated Dockerfile per pipeline step with an LLM."""
-    resolved_config = llm_config or resolve_llm_config()
+    """Generate deterministic Dockerfiles where registered, using the LLM otherwise."""
     if file_refs is None:
         if len(filenames) != len(ids):
             raise ValueError("filenames and ids must have the same length.")
@@ -57,46 +62,101 @@ async def generate_dockerfiles_with_agent(
             for filename, step_id in zip(filenames, ids)
         ]
 
-    steps = extract_pipeline_steps(pipeline_graph, file_refs)
+    all_steps = extract_pipeline_steps(pipeline_graph, file_refs)
+    steps = select_runtime_steps(all_steps)
     if not steps:
         raise ValueError("No pipeline steps were found for Dockerfile generation.")
 
-    file_contents = await _fetch_dockerfile_prompt_files(file_refs)
+    generator_registry = GeneratorRegistry()
+    deterministic_bundles = []
+    generic_steps = []
+    for step in steps:
+        generator = generator_registry.generator_for_step(step)
+        if generator is None:
+            generic_steps.append(step)
+            continue
+        deterministic_bundles.append(generator.generate(step, pipeline_graph))
+
+    deterministic_dockerfiles = [
+        bundle.dockerfile_artifact()
+        for bundle in deterministic_bundles
+    ]
+    generic_dockerfiles: list[dict[str, Any]] = []
     validation_errors: list[str] = []
-    artifact_payload: dict[str, Any] | None = None
+    if generic_steps:
+        resolved_config = llm_config or resolve_llm_config()
+        generic_step_ids = {str(step["flow_id"]) for step in generic_steps}
+        generic_file_refs = [
+            file_ref
+            for file_ref in file_refs
+            if str(file_ref.get("step_id") or "") in generic_step_ids
+        ]
+        file_contents = await _fetch_dockerfile_prompt_files(generic_file_refs)
+        for attempt in range(2):
+            try:
+                raw_payload = await _generate_dockerfiles_payload_with_llm(
+                    steps=generic_steps,
+                    pipeline_graph=pipeline_graph or {},
+                    file_contents=file_contents,
+                    llm_config=resolved_config,
+                    validation_errors=validation_errors,
+                )
+                normalized = _normalize_llm_dockerfile_payload(
+                    raw_payload,
+                    generic_steps,
+                )
+                generic_dockerfiles = normalized["dockerfiles"]
+                validate_dockerfile_artifacts(
+                    generic_dockerfiles,
+                    [step["flow_id"] for step in generic_steps],
+                    generic_steps,
+                )
+                break
+            except DeploymentArtifactValidationError as exc:
+                validation_errors = exc.errors
+            except ValueError as exc:
+                validation_errors = [str(exc)]
+            if validation_errors:
+                print(
+                    "[deployment_agents.py] LLM Dockerfile guardrail validation failed "
+                    f"on attempt {attempt + 1}: {validation_errors}"
+                )
+        else:
+            raise DeploymentArtifactValidationError(
+                "Dockerfile guardrail validation failed",
+                validation_errors,
+            )
 
-    for attempt in range(2):
-        try:
-            raw_payload = await _generate_dockerfiles_payload_with_llm(
-                steps=steps,
-                pipeline_graph=pipeline_graph or {},
-                file_contents=file_contents,
-                llm_config=resolved_config,
-                validation_errors=validation_errors,
-            )
-            artifact_payload = _normalize_llm_dockerfile_payload(raw_payload, steps)
-            validate_dockerfile_artifacts(
-                artifact_payload["dockerfiles"],
-                [step["flow_id"] for step in steps],
-                steps,
-            )
-            break
-        except DeploymentArtifactValidationError as exc:
-            validation_errors = exc.errors
-        except ValueError as exc:
-            validation_errors = [str(exc)]
-        if validation_errors:
-            print(
-                "[deployment_agents.py] LLM Dockerfile guardrail validation failed "
-                f"on attempt {attempt + 1}: {validation_errors}"
-            )
-    else:
-        raise DeploymentArtifactValidationError(
-            "Dockerfile guardrail validation failed",
-            validation_errors,
-        )
+    step_order = {
+        str(step["flow_id"]): index
+        for index, step in enumerate(steps)
+    }
+    dockerfiles = sorted(
+        [*deterministic_dockerfiles, *generic_dockerfiles],
+        key=lambda item: step_order.get(str(item.get("flow_id") or ""), len(steps)),
+    )
+    validate_dockerfile_artifacts(
+        dockerfiles,
+        [step["flow_id"] for step in steps],
+        steps,
+    )
+    artifact_payload = {
+        "dockerfiles": dockerfiles,
+        "runtime_artifacts": [
+            bundle.to_dict(include_content=True)
+            for bundle in deterministic_bundles
+        ],
+        "guardrails": {
+            "valid": True,
+            "checks": [
+                "registered node generators bypassed the LLM",
+                "generic nodes used the existing guarded LLM path",
+                "one validated Dockerfile was produced per executable pipeline step",
+            ],
+        },
+    }
 
-    print("[deployment_agents.py] LLM Dockerfile artifacts generated and validated.")
+    print("[deployment_agents.py] Deployment artifacts generated and validated.")
     if hasattr(ListDockerfilesResponse, "model_validate"):
         return ListDockerfilesResponse.model_validate(artifact_payload)
     return ListDockerfilesResponse.parse_obj(artifact_payload)

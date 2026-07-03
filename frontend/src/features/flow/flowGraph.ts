@@ -1,5 +1,12 @@
 import { Edge, Node } from 'reactflow';
-import { normalizeType } from '@/features/nodes/nodeSchema';
+import {
+  normalizeConfigurationStatus,
+  normalizeDefinitionId,
+  normalizeDefinitionVersion,
+  normalizeGeneratedArtifact,
+  normalizeNodeImplementation,
+  normalizeType,
+} from '@/features/nodes/nodeSchema';
 
 export type NormalizedGraph = {
   updated_at: string | null;
@@ -20,6 +27,11 @@ export type AgentGraphSnapshot = {
     database?: string;
     files?: string[];
     param?: Record<string, unknown>;
+    definition_id?: string;
+    definition_version?: number;
+    implementation?: Record<string, unknown>;
+    configuration_status?: string;
+    generated_artifact?: Record<string, unknown>;
   }>;
   edges: Array<{
     source: string;
@@ -103,6 +115,10 @@ export const createAgentGraphSnapshot = (graph: NormalizedGraph): AgentGraphSnap
     const files = Array.isArray(data.files)
       ? data.files.map(fileNameFromUnknown).filter(Boolean)
       : undefined;
+    const definitionId = normalizeDefinitionId(data.definition_id);
+    const definitionVersion = normalizeDefinitionVersion(data.definition_version);
+    const configurationStatus = normalizeConfigurationStatus(data.configuration_status);
+    const generatedArtifact = normalizeGeneratedArtifact(data.generated_artifact);
     return {
       id: String(node.id),
       type: normalizeType(data.type),
@@ -119,6 +135,13 @@ export const createAgentGraphSnapshot = (graph: NormalizedGraph): AgentGraphSnap
       ...(data.param && typeof data.param === "object" && !Array.isArray(data.param)
         ? { param: data.param as Record<string, unknown> }
         : {}),
+      ...(definitionId ? { definition_id: definitionId } : {}),
+      ...(definitionId && definitionVersion ? { definition_version: definitionVersion } : {}),
+      ...(definitionId
+        ? { implementation: normalizeNodeImplementation(data.implementation) }
+        : {}),
+      ...(configurationStatus ? { configuration_status: configurationStatus } : {}),
+      ...(generatedArtifact ? { generated_artifact: generatedArtifact } : {}),
     };
   }),
   edges: graph.edges.map((edge) => ({

@@ -54,13 +54,25 @@ temp/
 .cache/
 buckets/
 neo4j_data_volume/
+neo4j_data_volume.backup.*/
 neo4j_logs_volume/
 neo4j_plugins_volume/
 minio_data/
 neo4j_import_volume/
+neo4j_recovery_backup_*/
 ollama-volume/
 backend/openaiapi.ini
 backend/state/
 .env
 docker-compose.override.yml
 frontend/.env
+
+# Local implementation planning
+/plan.md
+/non_technical.md
+
+# Local Kubernetes credentials
+/deploy/argo/*.secret.local.yaml
+
+# Local reference workflow validation output
+/semt-validation-output/

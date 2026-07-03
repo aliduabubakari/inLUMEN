@@ -1391,6 +1391,9 @@ def build_openapi_schema() -> dict[str, Any]:
                         "image": {"type": "string"},
                         "command": {"type": "array", "items": {"type": "string"}},
                         "files": {"type": "array", "items": {"type": "string"}},
+                        "generator": {"type": "string"},
+                        "configuration_hash": {"type": "string"},
+                        "build_manifest": {"type": "string"},
                     },
                 },
                 "DockerfileArtifactsResponse": {
@@ -1403,6 +1406,10 @@ def build_openapi_schema() -> dict[str, Any]:
                         "dockerfiles": {
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/DockerfileArtifact"},
+                        },
+                        "runtime_artifacts": {
+                            "type": "array",
+                            "items": {"type": "object"},
                         },
                         "guardrails": {
                             "type": "object",

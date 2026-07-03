@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""SemT authentication, manager initialisation, and table loading for flow {{ flow_id_literal }}."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from semt_py.auth_manager import AuthManager
+from semt_py.dataset_manager import DatasetManager
+from semt_py.extension_manager import ExtensionManager
+from semt_py.modification_manager import ModificationManager
+from semt_py.reconciliation_manager import ReconciliationManager
+from semt_py.table_manager import TableManager
+from semt_py.utils import Utility
+
+
+CONFIG = json.loads({{ configuration_literal }})
+SERVICE_ID = str(CONFIG["service_id"])
+PARAMETERS = dict(CONFIG.get("parameters") or {})
+CONNECTION_REF = str(CONFIG.get("connection_ref") or "")
+CONTRACT_VERSION = "1"
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+LOGGER = logging.getLogger("inlumen.semt.setup")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_api_base_url() -> str:
+    configured = str(PARAMETERS.get("api_base_url") or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    env_url = os.getenv("SEMT_API_BASE_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+    raise RuntimeError(
+        "SemT API base URL is not configured. "
+        "Set it in the node parameters or the SEMT_API_BASE_URL environment variable."
+    )
+
+
+def _resolve_username() -> str:
+    configured = str(PARAMETERS.get("username") or "").strip()
+    if configured:
+        return configured
+    env_user = os.getenv("SEMT_API_USERNAME", "").strip()
+    if env_user:
+        return env_user
+    raise RuntimeError(
+        "SemT username is not configured. "
+        "Set it in the node parameters or the SEMT_API_USERNAME environment variable."
+    )
+
+
+def _resolve_password() -> str:
+    configured = str(PARAMETERS.get("password") or "")
+    if configured:
+        return configured
+    env_pass = os.getenv("SEMT_API_PASSWORD", "")
+    if env_pass:
+        return env_pass
+    raise RuntimeError(
+        "SemT password is not configured. "
+        "Set it in the node parameters or the SEMT_API_PASSWORD environment variable."
+    )
+
+
+def _resolve_token() -> str | None:
+    configured = str(PARAMETERS.get("token") or "").strip()
+    if configured:
+        return configured
+    env_token = os.getenv("SEMT_API_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    return None
+
+
+def _resolve_dataset_id() -> str:
+    configured = str(PARAMETERS.get("dataset_id") or "").strip()
+    if configured:
+        return configured
+    env_id = os.getenv("SEMT_DATASET_ID", "").strip()
+    if env_id:
+        return env_id
+    return "114"
+
+
+def _resolve_table_name() -> str:
+    configured = str(PARAMETERS.get("table_name") or "").strip()
+    if configured:
+        return configured
+    env_name = os.getenv("SEMT_TABLE_NAME", "").strip()
+    if env_name:
+        return env_name
+    return "my_table"
+
+
+def _resolve_input_path() -> Path:
+    input_path = Path(
+        os.getenv("INLUMEN_INPUT_PATH", "/data/input.csv")
+    )
+    if not input_path.is_file():
+        raise FileNotFoundError(
+            f"Input CSV not found at {input_path}. "
+            "Upload a file via the Input Data node or set INLUMEN_INPUT_PATH."
+        )
+    return input_path
+
+
+def _resolve_output_path() -> Path:
+    output_path = Path(
+        os.getenv("INLUMEN_OUTPUT_PATH", "/data/output.json")
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path
+
+
+def main() -> None:
+    LOGGER.info(
+        "SemT Setup starting  service=%s  connection_ref=%s",
+        SERVICE_ID,
+        CONNECTION_REF,
+    )
+
+    # --- 1. Resolve configuration ---
+    base_url = _resolve_api_base_url()
+    api_url = base_url + "/api"
+    username = _resolve_username()
+    password = _resolve_password()
+    bearer_token = _resolve_token()
+    dataset_id = _resolve_dataset_id()
+    table_name = _resolve_table_name()
+    input_path = _resolve_input_path()
+    output_path = _resolve_output_path()
+
+    # --- 2. Authenticate ---
+    LOGGER.info("Authenticating to SemT API at %s as %s", base_url, username)
+    auth_manager = AuthManager(api_url, username, password)
+
+    if not bearer_token:
+        LOGGER.info("No bearer token provided; fetching via AuthManager.get_token()")
+        try:
+            bearer_token = auth_manager.get_token()
+            LOGGER.info("Bearer token obtained successfully.")
+        except Exception as exc:
+            LOGGER.warning("Failed to obtain bearer token: %s", exc)
+            bearer_token = None
+    else:
+        LOGGER.info("Using configured bearer token.")
+
+    # --- 3. Initialise managers ---
+    LOGGER.info("Initialising SemT service managers ...")
+    reconciliation_manager = ReconciliationManager(base_url, auth_manager)
+    dataset_manager = DatasetManager(base_url, auth_manager)
+    table_manager = TableManager(base_url, auth_manager)
+    extension_manager = ExtensionManager(base_url, bearer_token or auth_manager)
+    utility = Utility(base_url, auth_manager)
+    modification_manager = ModificationManager(base_url, bearer_token or auth_manager)
+
+    # --- 4. Load CSV and upload to SemT ---
+    LOGGER.info(
+        "Loading CSV from %s  dataset_id=%s  table_name=%s",
+        input_path,
+        dataset_id,
+        table_name,
+    )
+    df = pd.read_csv(input_path)
+    LOGGER.info("CSV loaded: %d rows × %d columns", len(df.index), len(df.columns))
+
+    table_id, message, table_data = table_manager.add_table(
+        dataset_id, df, table_name
+    )
+    LOGGER.info("Table uploaded to SemT: table_id=%s  message=%s", table_id, message)
+
+    # --- 5. Retrieve the table to verify and pass downstream ---
+    retrieved = table_manager.get_table(dataset_id, table_id)
+    if not isinstance(retrieved, dict):
+        raise RuntimeError(
+            f"Failed to retrieve table {table_id} from dataset {dataset_id}."
+        )
+
+    # --- 6. Write the SemT table envelope as output for downstream nodes ---
+    envelope = {
+        "schema_version": 1,
+        "kind": "inlumen.table",
+        "contract_version": CONTRACT_VERSION,
+        "records": json.loads(df.head(0).to_json(orient="records")),
+        "semt_table": retrieved,
+    }
+
+    # Include the actual records from the retrieved table if available
+    if isinstance(retrieved.get("rows"), dict) and isinstance(
+        retrieved.get("columns"), dict
+    ):
+        columns = list(retrieved["columns"].keys())
+        records = []
+        for row in (retrieved["rows"] or {}).values():
+            cells = row.get("cells") if isinstance(row, dict) else {}
+            records.append(
+                {
+                    column: (cells.get(column) or {}).get("label", "")
+                    for column in columns
+                }
+            )
+        envelope["records"] = records
+
+    output_path.write_text(
+        json.dumps(envelope, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    # --- 7. Print status ---
+    status: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "inlumen.semt.setup",
+        "timestamp_utc": _utc_now(),
+        "connection_ref": CONNECTION_REF,
+        "api_base_url": base_url,
+        "username": username,
+        "authenticated": bearer_token is not None,
+        "dataset_id": dataset_id,
+        "table_name": table_name,
+        "table_id": str(table_id),
+        "input_rows": len(df.index),
+        "input_columns": len(df.columns),
+        "managers_initialised": [
+            "ReconciliationManager",
+            "DatasetManager",
+            "TableManager",
+            "ExtensionManager",
+            "Utility",
+            "ModificationManager",
+        ],
+    }
+
+    print(
+        json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True)
+    )
+
+    if not bearer_token:
+        LOGGER.error("SemT Setup completed WITHOUT a valid bearer token.")
+        sys.exit(1)
+
+    LOGGER.info("SemT Setup completed successfully.")
+
+
+if __name__ == "__main__":
+    main()

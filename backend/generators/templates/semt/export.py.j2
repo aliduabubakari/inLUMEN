@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""SemT export operation for flow {{ flow_id_literal }}."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from semt_py.auth_manager import AuthManager
+from semt_py.utils import Utility
+
+
+CONFIG = json.loads({{ configuration_literal }})
+SERVICE_ID = str(CONFIG["service_id"])
+PARAMETERS = dict(CONFIG.get("parameters") or {})
+CONNECTION_REF = str(CONFIG.get("connection_ref") or "")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+LOGGER = logging.getLogger("inlumen.semt.export")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_api_base_url() -> str:
+    env_url = os.getenv("SEMT_API_BASE_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+    param_url = str(PARAMETERS.get("api_base_url") or "").strip()
+    if param_url:
+        return param_url.rstrip("/")
+    raise RuntimeError(
+        "SemT API base URL is not configured. "
+        "Set SEMT_API_BASE_URL at runtime or api_base_url in node parameters."
+    )
+
+
+def _resolve_dataset_id() -> str:
+    configured = str(PARAMETERS.get("dataset_id") or "").strip()
+    if configured:
+        return configured
+    env_id = os.getenv("SEMT_DATASET_ID", "").strip()
+    if env_id:
+        return env_id
+    raise RuntimeError(
+        "SemT dataset_id is required for export. "
+        "Set it in node parameters or inherit from the pipeline."
+    )
+
+
+def _resolve_table_id() -> str:
+    configured = str(PARAMETERS.get("table_id") or "").strip()
+    if configured:
+        return configured
+    env_id = os.getenv("SEMT_TABLE_ID", "").strip()
+    if env_id:
+        return env_id
+    raise RuntimeError(
+        "SemT table_id is required for export. "
+        "Set it in node parameters or inherit from the pipeline."
+    )
+
+
+def _extract_ids_from_input(input_path: Path) -> tuple[str, str]:
+    """Extract dataset_id / table_id from the input JSON envelope."""
+    try:
+        raw = json.loads(input_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "", ""
+    if isinstance(raw, dict):
+        return (
+            str(raw.get("dataset_id") or "").strip(),
+            str(raw.get("table_id") or "").strip(),
+        )
+    return "", ""
+
+
+def main() -> None:
+    LOGGER.info(
+        "SemT Export starting  service=%s  connection_ref=%s",
+        SERVICE_ID,
+        CONNECTION_REF,
+    )
+
+    # --- 1. Resolve configuration ---
+    base_url = _resolve_api_base_url()
+    api_url = base_url + "/api"
+    output_format = str(PARAMETERS.get("output_format", "json")).strip() or "json"
+    output_filename = str(PARAMETERS.get("output_filename", "exported_data")).strip() or "exported_data"
+
+    # Resolve dataset_id / table_id — inherit from input envelope or params
+    input_path = Path(os.getenv("INLUMEN_INPUT_PATH", "/data/input.json"))
+    input_ds, input_tbl = _extract_ids_from_input(input_path)
+    dataset_id = input_ds or _resolve_dataset_id()
+    table_id = input_tbl or _resolve_table_id()
+
+    # Determine output path
+    ext = ".csv" if output_format == "csv" else ".json"
+    output_dir = os.getenv("INLUMEN_OUTPUT_PATH", "/data")
+    output_path = Path(output_dir) / f"{output_filename}{ext}"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- 2. Authenticate ---
+    username = os.getenv("SEMT_API_USERNAME", "").strip()
+    password = os.getenv("SEMT_API_PASSWORD", "")
+    if not username or not password:
+        raise RuntimeError(
+            "SEMT_API_USERNAME and SEMT_API_PASSWORD are required at runtime."
+        )
+    auth_manager = AuthManager(api_url, username, password)
+    utility = Utility(base_url, auth_manager)
+
+    # --- 3. Download ---
+    LOGGER.info(
+        "Exporting table %s from dataset %s as %s → %s",
+        table_id, dataset_id, output_format, output_path,
+    )
+
+    if output_format == "csv":
+        downloaded = utility.download_csv(
+            dataset_id=dataset_id,
+            table_id=table_id,
+            output_file=str(output_path),
+        )
+    else:
+        downloaded = utility.download_json(
+            dataset_id=dataset_id,
+            table_id=table_id,
+            output_file=str(output_path),
+        )
+
+    # --- 4. Status ---
+    status: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "inlumen.semt.export",
+        "timestamp_utc": _utc_now(),
+        "connection_ref": CONNECTION_REF,
+        "dataset_id": dataset_id,
+        "table_id": str(table_id),
+        "output_format": output_format,
+        "output_file": str(output_path),
+        "file_exists": Path(downloaded).is_file() if downloaded else False,
+        "success": bool(downloaded),
+    }
+    print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+
+    if not downloaded or not Path(downloaded).is_file():
+        LOGGER.error("SemT Export failed: no file produced.")
+        sys.exit(1)
+
+    LOGGER.info("SemT Export completed: %s", downloaded)
+
+
+if __name__ == "__main__":
+    main()

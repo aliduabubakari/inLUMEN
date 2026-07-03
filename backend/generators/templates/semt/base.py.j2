@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""Deterministic inLUMEN SemT runtime for flow {{ flow_id_literal }}."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from semt_py.auth_manager import AuthManager
+from semt_py.extension_manager import ExtensionManager
+from semt_py.modification_manager import ModificationManager
+from semt_py.reconciliation_manager import ReconciliationManager
+from semt_py.table_manager import TableManager
+from semt_py.utils import Utility
+
+
+CONFIG = json.loads({{ configuration_literal }})
+SERVICE_ID = str(CONFIG["service_id"])
+PARAMETERS = dict(CONFIG.get("parameters") or {})
+CONNECTION_REF = str(CONFIG.get("connection_ref") or "")
+CONTRACT_VERSION = "{{ contract_version }}"
+
+# Propagated from the input envelope (set by main())
+_DATASET_ID = ""
+_TABLE_ID = ""
+METADATA_SUFFIX = "__semt_metadata"
+TABLE_METADATA_COLUMN = "__inlumen_table_metadata"
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+LOGGER = logging.getLogger("inlumen.semt")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _json_value(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return value
+
+
+def _cell(row_id: str, column: str, value: Any) -> dict[str, Any]:
+    return {
+        "id": f"{row_id}${column}",
+        "label": "" if _json_value(value) is None else str(_json_value(value)),
+        "metadata": [],
+        "annotationMeta": {
+            "annotated": False,
+            "match": {"value": False},
+        },
+    }
+
+
+def dataframe_to_table(
+    frame: pd.DataFrame,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    previous = previous if isinstance(previous, dict) else {}
+    previous_rows = previous.get("rows") if isinstance(previous.get("rows"), dict) else {}
+    previous_columns = (
+        previous.get("columns") if isinstance(previous.get("columns"), dict) else {}
+    )
+    table_meta = (
+        deepcopy(previous.get("table"))
+        if isinstance(previous.get("table"), dict)
+        else {}
+    )
+    table_meta.update(
+        {
+            "id": table_meta.get("id") or os.getenv("SEMT_TABLE_ID", "inlumen-runtime-table"),
+            "idDataset": table_meta.get("idDataset")
+            or os.getenv("SEMT_DATASET_ID", "inlumen-runtime-dataset"),
+            "name": table_meta.get("name") or os.getenv("SEMT_TABLE_NAME", "inLUMEN table"),
+            "nCols": len(frame.columns),
+            "nRows": len(frame.index),
+            "nCells": len(frame.columns) * len(frame.index),
+            "lastModifiedDate": _utc_now(),
+        }
+    )
+    table_meta.setdefault("nCellsReconciliated", 0)
+
+    columns: dict[str, Any] = {}
+    for column in frame.columns:
+        column_name = str(column)
+        prior_column = previous_columns.get(column_name)
+        columns[column_name] = (
+            deepcopy(prior_column)
+            if isinstance(prior_column, dict)
+            else {
+                "id": column_name,
+                "label": column_name,
+                "status": "empty",
+                "context": {},
+                "metadata": [],
+                "annotationMeta": {},
+            }
+        )
+        columns[column_name]["id"] = column_name
+        columns[column_name]["label"] = column_name
+
+    rows: dict[str, Any] = {}
+    for position, (_, values) in enumerate(frame.iterrows()):
+        row_id = f"r{position}"
+        prior_row = previous_rows.get(row_id)
+        prior_cells = (
+            prior_row.get("cells")
+            if isinstance(prior_row, dict) and isinstance(prior_row.get("cells"), dict)
+            else {}
+        )
+        cells: dict[str, Any] = {}
+        for column in frame.columns:
+            column_name = str(column)
+            next_cell = _cell(row_id, column_name, values[column])
+            prior_cell = prior_cells.get(column_name)
+            if isinstance(prior_cell, dict):
+                next_cell["metadata"] = deepcopy(prior_cell.get("metadata") or [])
+                next_cell["annotationMeta"] = deepcopy(
+                    prior_cell.get("annotationMeta")
+                    or {"annotated": False, "match": {"value": False}}
+                )
+            cells[column_name] = next_cell
+        rows[row_id] = {"id": row_id, "cells": cells}
+
+    return {
+        "table": table_meta,
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def table_to_dataframe(table: dict[str, Any]) -> pd.DataFrame:
+    columns = list((table.get("columns") or {}).keys())
+    records = []
+    for row in (table.get("rows") or {}).values():
+        cells = row.get("cells") if isinstance(row, dict) else {}
+        records.append(
+            {
+                column: (cells.get(column) or {}).get("label")
+                for column in columns
+            }
+        )
+    return pd.DataFrame(records, columns=columns)
+
+
+def _metadata_payload(table: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "contract": "inlumen.table",
+        "contract_version": CONTRACT_VERSION,
+        "table": table.get("table") or {},
+        "columns": table.get("columns") or {},
+    }
+
+
+def _table_from_csv(path: Path) -> dict[str, Any]:
+    frame = pd.read_csv(path)
+    metadata_payload: dict[str, Any] = {}
+    if TABLE_METADATA_COLUMN in frame.columns:
+        metadata_values = frame[TABLE_METADATA_COLUMN].dropna()
+        if not metadata_values.empty and str(metadata_values.iloc[0]).strip():
+            metadata_payload = json.loads(str(metadata_values.iloc[0]))
+        frame = frame.drop(columns=[TABLE_METADATA_COLUMN])
+
+    cell_metadata: dict[str, list[Any]] = {}
+    for column in list(frame.columns):
+        if not str(column).endswith(METADATA_SUFFIX):
+            continue
+        source_column = str(column)[: -len(METADATA_SUFFIX)]
+        cell_metadata[source_column] = frame[column].tolist()
+        frame = frame.drop(columns=[column])
+
+    table = dataframe_to_table(frame)
+    if isinstance(metadata_payload.get("table"), dict):
+        table["table"].update(metadata_payload["table"])
+    if isinstance(metadata_payload.get("columns"), dict):
+        table["columns"].update(metadata_payload["columns"])
+
+    for source_column, values in cell_metadata.items():
+        for index, encoded in enumerate(values):
+            if encoded is None:
+                continue
+            try:
+                if pd.isna(encoded):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            row = table["rows"].get(f"r{index}")
+            if not row or source_column not in row["cells"]:
+                continue
+            parsed = json.loads(str(encoded))
+            if isinstance(parsed, dict):
+                row["cells"][source_column]["metadata"] = parsed.get("metadata") or []
+                row["cells"][source_column]["annotationMeta"] = (
+                    parsed.get("annotationMeta")
+                    or {"annotated": False, "match": {"value": False}}
+                )
+    return table
+
+
+def _table_from_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and isinstance(payload.get("semt_table"), dict):
+        return payload["semt_table"]
+    if isinstance(payload, dict) and isinstance(payload.get("records"), list):
+        return dataframe_to_table(pd.DataFrame(payload["records"]))
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        return dataframe_to_table(pd.DataFrame(payload["items"]))
+    if isinstance(payload, list):
+        return dataframe_to_table(pd.DataFrame(payload))
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("table"), dict)
+        and isinstance(payload.get("columns"), dict)
+        and isinstance(payload.get("rows"), dict)
+    ):
+        return payload
+    raise ValueError(
+        "JSON input must be records, an inLUMEN table envelope, or a SemT table."
+    )
+
+
+def load_table(path: Path) -> dict[str, Any]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return _table_from_csv(path)
+    if suffix == ".json":
+        return _table_from_json(path)
+    raise ValueError(f"Unsupported input encoding {suffix!r}; use .csv or .json.")
+
+
+def _write_csv(table: dict[str, Any], path: Path) -> None:
+    frame = table_to_dataframe(table)
+    for column in list(frame.columns):
+        encoded = []
+        has_metadata = False
+        for row in (table.get("rows") or {}).values():
+            cell = (row.get("cells") or {}).get(column, {})
+            metadata = cell.get("metadata") or []
+            annotation_meta = cell.get("annotationMeta") or {}
+            has_metadata = has_metadata or bool(metadata)
+            encoded.append(
+                json.dumps(
+                    {
+                        "metadata": metadata,
+                        "annotationMeta": annotation_meta,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        if has_metadata:
+            frame[f"{column}{METADATA_SUFFIX}"] = encoded
+
+    metadata = json.dumps(
+        _metadata_payload(table),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    frame[TABLE_METADATA_COLUMN] = ""
+    if not frame.empty:
+        frame.loc[frame.index[0], TABLE_METADATA_COLUMN] = metadata
+    frame.to_csv(path, index=False)
+
+
+def _write_json(table: dict[str, Any], path: Path) -> None:
+    frame = table_to_dataframe(table)
+    envelope: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "inlumen.table",
+        "contract_version": CONTRACT_VERSION,
+        "records": [
+            {key: _json_value(value) for key, value in record.items()}
+            for record in frame.to_dict(orient="records")
+        ],
+        "semt_table": table,
+    }
+    # Propagate dataset_id / table_id so downstream nodes can pick them up
+    if _DATASET_ID:
+        envelope["dataset_id"] = _DATASET_ID
+    if _TABLE_ID:
+        envelope["table_id"] = _TABLE_ID
+    path.write_text(
+        json.dumps(envelope, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_table(table: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        _write_csv(table, path)
+        return
+    if suffix == ".json":
+        _write_json(table, path)
+        return
+    raise ValueError(f"Unsupported output encoding {suffix!r}; use .csv or .json.")
+
+
+def _resolve_api_base_url() -> str:
+    """Resolve SemT API base URL from env or parameters."""
+    env_url = os.getenv("SEMT_API_BASE_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+    param_url = str(PARAMETERS.get("api_base_url") or "").strip()
+    if param_url:
+        return param_url.rstrip("/")
+    raise RuntimeError(
+        "SemT API base URL is not configured. "
+        "Set SEMT_API_BASE_URL at runtime or api_base_url in node parameters."
+    )
+
+
+def build_auth_manager() -> AuthManager:
+    username = os.getenv("SEMT_API_USERNAME", "").strip()
+    password = os.getenv("SEMT_API_PASSWORD", "")
+    if not username or not password:
+        raise RuntimeError(
+            "SEMT_API_USERNAME and SEMT_API_PASSWORD are required at runtime. "
+            f"Connection profile: {CONNECTION_REF or 'unspecified'}."
+        )
+    return AuthManager(_resolve_api_base_url() + "/api", username, password)
+
+
+{% include operation_template %}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run one deterministic SemT node.")
+    parser.add_argument(
+        "--input",
+        default=os.getenv("INLUMEN_INPUT_PATH", "/data/input.json"),
+    )
+    parser.add_argument(
+        "--output",
+        default=os.getenv("INLUMEN_OUTPUT_PATH", "/data/output.json"),
+    )
+    return parser.parse_args()
+
+
+def _extract_ids_from_input(input_path: Path) -> None:
+    """Extract dataset_id / table_id from the input JSON envelope."""
+    global _DATASET_ID, _TABLE_ID
+    try:
+        raw = json.loads(input_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if isinstance(raw, dict):
+        _DATASET_ID = str(raw.get("dataset_id") or "").strip()
+        _TABLE_ID = str(raw.get("table_id") or "").strip()
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input table not found: {input_path}")
+
+    _extract_ids_from_input(input_path)
+    LOGGER.info(
+        "Running SemT %s service=%s connection_ref=%s  dataset_id=%s  table_id=%s",
+        CONFIG["operation"],
+        SERVICE_ID,
+        CONNECTION_REF,
+        _DATASET_ID or "-",
+        _TABLE_ID or "-",
+    )
+    table = load_table(input_path)
+    result = execute_operation(table)
+    write_table(result, output_path)
+    print(
+        json.dumps(
+            {
+                "contract": "inlumen.table",
+                "contract_version": CONTRACT_VERSION,
+                "input": str(input_path),
+                "output": str(output_path),
+                "rows": len(result.get("rows") or {}),
+                "columns": len(result.get("columns") or {}),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

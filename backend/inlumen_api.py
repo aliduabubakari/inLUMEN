@@ -16,13 +16,16 @@ from analytics_api import (
 )
 from auth_middleware import require_auth
 from chat_state import clear_state_from_disk
+from generators.routes import create_generator_blueprint
 from graph_client import dispatch_graph_request
 from local_api_client import LocalApiResponse
+from node_definitions import create_node_definitions_blueprint
 from object_client import dispatch_object_request
 from provenance_provo import build_prov_o_jsonld, provenance_prov_o_filename
 from provenance_report import build_provenance_pdf, provenance_report_filename
 from public_api import create_public_api_blueprint
 from runtime_config import add_cors_headers, get_service_port
+from semt import create_semt_blueprint
 
 
 INLUMEN_API_PORT = get_service_port("INLUMEN_API_PORT", 5000)
@@ -32,6 +35,9 @@ CHATBOT_CONFIGS_PATH = Path(
 
 app = Flask(__name__)
 app.register_blueprint(create_public_api_blueprint())
+app.register_blueprint(create_node_definitions_blueprint())
+app.register_blueprint(create_semt_blueprint())
+app.register_blueprint(create_generator_blueprint())
 app.add_url_rule(
     "/agentic_generate_dockerfiles",
     endpoint="agentic_generate_dockerfiles",

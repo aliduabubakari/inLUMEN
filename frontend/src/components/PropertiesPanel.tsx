@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { PlusCircle, Upload, X, Eye } from 'lucide-react';
 import { FilePreviewDialog, PreviewType } from '@/components/properties/FilePreviewDialog';
+import { NodeDefinitionEditor } from '@/components/properties/editors/NodeDefinitionEditor';
 import { getTypeColor, getTypeIcon } from '@/components/properties/nodeAppearance';
 import {
   normalizeType,
@@ -25,6 +26,7 @@ import {
   isTextPreviewName,
   isTextPreviewFile,
   NodeFileReference,
+  GeneratedArtifact,
 } from '@/features/nodes/nodeSchema';
 import {
   readNodeFile,
@@ -47,6 +49,11 @@ export type PropertyNodeData = {
   param?: NodeParamMap;
   endpoint?: string;
   database?: StorageDatabaseOption | string;
+  definition_id?: string;
+  definition_version?: number;
+  implementation?: Record<string, unknown>;
+  configuration_status?: "unconfigured" | "valid" | "invalid";
+  generated_artifact?: GeneratedArtifact;
   [key: string]: unknown;
 };
 
@@ -71,6 +78,9 @@ interface PropertiesPanelProps {
 
 export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, className }: PropertiesPanelProps) {
   const nodeType: StepType = normalizeType(selectedNode?.data?.type ?? selectedNode?.type);
+  const isSemTNode = String(selectedNode?.data?.definition_id ?? "").startsWith("semt.");
+  const isSemTInputDataNode = selectedNode?.data?.definition_id === "core.input-data";
+  const canManageFiles = typeHasFiles(nodeType) && !isSemTNode;
 
   const [label, setLabel] = useState('');
   const [description, setDescription] = useState('');
@@ -251,7 +261,7 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
 
   // Upload newly added files through the backend. Same filename replaces older entry.
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!typeHasFiles(nodeType)) return;
+    if (!canManageFiles) return;
     if (!selectedNode) return;
     const picked = e.target.files ? Array.from(e.target.files) : [];
     if (picked.length === 0) return;
@@ -504,6 +514,30 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
               />
             </div>
 
+            <NodeDefinitionEditor
+              nodeId={selectedNode.id}
+              definitionId={selectedNode.data.definition_id}
+              implementation={selectedNode.data.implementation}
+              generatedArtifact={selectedNode.data.generated_artifact}
+              onChange={(implementation, configurationStatus) => {
+                pushNodeUpdate({
+                  implementation,
+                  configuration_status: configurationStatus,
+                  ...(selectedNode.data.generated_artifact
+                    ? {
+                        generated_artifact: {
+                          ...selectedNode.data.generated_artifact,
+                          status: "stale",
+                        },
+                      }
+                    : {}),
+                });
+              }}
+              onArtifactGenerated={(generatedArtifact) => {
+                pushNodeUpdate({ generated_artifact: generatedArtifact });
+              }}
+            />
+
             {/* Content ONLY for input/output */}
             {typeHasContent(nodeType) && (
               <div className="space-y-2">
@@ -632,8 +666,8 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
               </div>
             )}
 
-            {/* Files ONLY for input/output/action/custom (has_files derived internally) */}
-            {typeHasFiles(nodeType) && (
+            {/* SemT source data belongs on the Input Data ingress node, not an operation node. */}
+            {canManageFiles && (
               <div className="space-y-2">
                 <Label className="text-sm">Files</Label>
                 <div className="border border-dashed border-border rounded-lg p-4">
@@ -654,6 +688,12 @@ export function PropertiesPanel({ selectedNode, onNodeUpdate, onRemoveNode, clas
                     <Upload className="w-4 h-4 mr-2" />
                     Upload Files
                   </Button>
+
+                  {isSemTInputDataNode && (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      SemT pipelines require one CSV here, connected directly to the first SemT node.
+                    </p>
+                  )}
 
                   {files.length > 0 && (
                     <div className="mt-3 space-y-2">
