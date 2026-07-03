@@ -38,6 +38,7 @@ import {
 } from '@/features/flow/flowPersistence';
 import { uploadNodeFile } from '@/features/nodes/nodePersistence';
 import { normalizeType, typeHasFiles } from '@/features/nodes/nodeSchema';
+import { buildSemTPipelineGraphFromPython } from '@/features/semt/semtPythonImport';
 import {
   createAgentGraphSnapshot,
   downloadJsonFile,
@@ -932,6 +933,26 @@ export const FlowCanvas = forwardRef<FlowCanvasRef, FlowCanvasProps>(({
       if (!file) return;
       const lowerName = file.name.toLowerCase();
       if (lowerName.endsWith('.py')) {
+        const source = await file.text();
+        const semtGraph = buildSemTPipelineGraphFromPython(source);
+        if (semtGraph) {
+          const importedGraph = normalizeGraph(semtGraph);
+          pushHistorySnapshot();
+          onCanvasEdited?.();
+          markLocalWrite(1200);
+          await rebuildBackendFromFlow(importedGraph.nodes, importedGraph.edges);
+          applyGraph(semtGraph, importedGraph);
+          selectedNodeIdRef.current = null;
+          setSelectedNode(null);
+          onNodeSelect(null, { openInspector: false });
+          if (reactFlowInstance) {
+            reactFlowInstance.setViewport(normalizeViewport(semtGraph.viewport));
+          }
+          toast.success('SemT pipeline imported', {
+            description: `Generated ${importedGraph.nodes.length} nodes from ${file.name}.`,
+          });
+          return;
+        }
         await importPythonScript(file);
         return;
       }
