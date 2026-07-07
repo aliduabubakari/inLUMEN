@@ -11,6 +11,9 @@ import { VersionsPanel } from '@/components/versions/VersionsPanel';
 import { CanvasSyncStatus, ChatMessage } from '@/features/chat/chatTypes';
 import {
   MAIN_PIPELINE_VERSION_UID,
+  clearPipelineWorkspace,
+  fetchProvenanceProvO,
+  fetchProvenanceReport,
   restorePipelineVersion,
   savePipelineActiveVersion,
   setPipelineVersionAsMain,
@@ -117,6 +120,23 @@ const readSavedTheme = () => {
 const createDownloadTimestamp = () =>
   new Date().toISOString().replace(/[:.]/g, "-");
 
+const safeDownloadLabel = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "main";
+
+const downloadBlob = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+};
+
 const normalizeSavedConversation = (value: unknown): ChatMessage[] => {
   const messages = Array.isArray(value)
     ? value
@@ -197,6 +217,9 @@ const Index = () => {
   const [versionsRefreshKey, setVersionsRefreshKey] = useState(0);
   const [isRestoringVersion, setIsRestoringVersion] = useState(false);
   const [isSettingMainVersion, setIsSettingMainVersion] = useState(false);
+  const [isClearingAll, setIsClearingAll] = useState(false);
+  const [isGeneratingProvenanceReport, setIsGeneratingProvenanceReport] = useState(false);
+  const [isDownloadingProvO, setIsDownloadingProvO] = useState(false);
   const [activeVersionUid, setActiveVersionUid] = useState(MAIN_PIPELINE_VERSION_UID);
   const [activeVersionName, setActiveVersionName] = useState('Main');
   const [activePipelineDescription, setActivePipelineDescription] = useState('');
@@ -404,6 +427,9 @@ const Index = () => {
     setFlowNodes(prev => prev.map(node =>
       node.id === id ? { ...node, data: { ...node.data, ...data } } : node
     ));
+    setSelectedNode(prev =>
+      prev?.id === id ? { ...prev, data: { ...prev.data, ...data } } : prev
+    );
     flowCanvasRef.current?.updateNode(id, data);
   }, []);
 
@@ -522,8 +548,20 @@ const Index = () => {
     }
   };
 
-  const handleClearConversation = async () => {
+  const resetLocalConversation = useCallback(() => {
     setConversation([]);
+    setChatSessionId("");
+    localStorage.removeItem(CHAT_SESSION_KEY);
+    localStorage.removeItem(CHAT_HISTORY_KEY);
+    localStorage.removeItem(CHAT_TRANSCRIPT_KEY);
+    setCanvasSyncStatus({
+      state: 'idle',
+      message: 'Canvas is ready',
+    });
+  }, []);
+
+  const handleClearConversation = async () => {
+    resetLocalConversation();
     toast.success("Conversation cleared", {
       description: "Your conversation history has been reset",
     });
@@ -539,15 +577,6 @@ const Index = () => {
         console.warn("Failed to reset backend chat session:", e);
       }
     }
-
-    setChatSessionId("");
-    localStorage.removeItem(CHAT_SESSION_KEY);
-    localStorage.removeItem(CHAT_HISTORY_KEY);
-    localStorage.removeItem(CHAT_TRANSCRIPT_KEY);
-    setCanvasSyncStatus({
-      state: 'idle',
-      message: 'Canvas is ready',
-    });
   };
 
   const handleToggleLibrary = () => {
@@ -884,6 +913,101 @@ const Index = () => {
     }
   };
 
+  const handleClearAll = async () => {
+    const confirmed = window.confirm(
+      "Clear the entire workspace? This will empty Main, delete all saved versions except Main, clear the chat session, and clean the provenance report."
+    );
+    if (!confirmed) return;
+
+    if (activeVersionSaveTimeoutRef.current) {
+      window.clearTimeout(activeVersionSaveTimeoutRef.current);
+      activeVersionSaveTimeoutRef.current = null;
+    }
+    activeVersionDirtyRef.current = false;
+
+    try {
+      setIsClearingAll(true);
+      setIsRestoringVersion(true);
+      const result = await clearPipelineWorkspace(chatSessionId || null);
+      const syncedGraph = flowCanvasRef.current
+        ? await flowCanvasRef.current.syncFromBackend(result.graph)
+        : null;
+
+      updateActiveVersion(MAIN_PIPELINE_VERSION_UID, 'Main');
+      setActivePipelineDescription(result.version.description ?? '');
+      applyActiveVersionTimestamps(result.version);
+      setFlowNodes([]);
+      setSelectedNode(null);
+      resetLocalConversation();
+      localStorage.removeItem('ai-flow');
+      localStorage.removeItem('ai-flow-nodes');
+      localStorage.removeItem('ai-flow-edges');
+      setVersionsRefreshKey((key) => key + 1);
+
+      const updatedAt = result.version.updated_at ?? syncedGraph?.updated_at ?? null;
+      setCanvasSyncStatus({
+        state: 'idle',
+        message: '',
+        updatedAt,
+      });
+      toast.success("Workspace cleared", {
+        description: "Main is empty, saved versions are deleted, chat is reset, and provenance is clean.",
+      });
+    } catch (error) {
+      console.error("Error clearing workspace:", error);
+      toast.error("Failed to clear workspace", {
+        description: error instanceof Error ? error.message : "Unknown error occurred",
+      });
+    } finally {
+      setIsRestoringVersion(false);
+      setIsClearingAll(false);
+    }
+  };
+
+  const handleGenerateProvenanceReport = async () => {
+    try {
+      setIsGeneratingProvenanceReport(true);
+      await flushActiveVersionSnapshot().catch((error) => {
+        console.warn("Failed to save active version before provenance report:", error);
+      });
+      const blob = await fetchProvenanceReport(activeVersionUidRef.current);
+      const safeVersionName = safeDownloadLabel(activeVersionNameRef.current || "main");
+      downloadBlob(blob, `inlumen-provenance-${safeVersionName}.pdf`);
+      toast.success("Provenance report generated", {
+        description: `${activeVersionNameRef.current || 'Main'} report downloaded as PDF.`,
+      });
+    } catch (error) {
+      console.error("Error generating provenance report:", error);
+      toast.error("Failed to generate provenance report", {
+        description: error instanceof Error ? error.message : "Unknown error occurred",
+      });
+    } finally {
+      setIsGeneratingProvenanceReport(false);
+    }
+  };
+
+  const handleDownloadProvO = async () => {
+    try {
+      setIsDownloadingProvO(true);
+      await flushActiveVersionSnapshot().catch((error) => {
+        console.warn("Failed to save active version before PROV-O export:", error);
+      });
+      const blob = await fetchProvenanceProvO(activeVersionUidRef.current);
+      const safeVersionName = safeDownloadLabel(activeVersionNameRef.current || "main");
+      downloadBlob(blob, `inlumen-provenance-${safeVersionName}.jsonld`);
+      toast.success("PROV-O provenance exported", {
+        description: `${activeVersionNameRef.current || 'Main'} downloaded as JSON-LD.`,
+      });
+    } catch (error) {
+      console.error("Error exporting PROV-O provenance:", error);
+      toast.error("Failed to export PROV-O provenance", {
+        description: error instanceof Error ? error.message : "Unknown error occurred",
+      });
+    } finally {
+      setIsDownloadingProvO(false);
+    }
+  };
+
   const handleRemoveNode = (nodeId: string) => {
     setFlowNodes(prev => prev.filter(node => node.id !== nodeId));
     if (selectedNode?.id === nodeId) {
@@ -912,8 +1036,14 @@ const Index = () => {
         onToggleInspector={() => handleToggleRightPanel('inspector')}
         onToggleChat={() => handleToggleRightPanel('chat')}
         onToggleVersions={() => { void handleToggleVersionsPanel(); }}
+        onClearAll={() => { void handleClearAll(); }}
+        onGenerateProvenanceReport={() => { void handleGenerateProvenanceReport(); }}
+        onDownloadProvO={() => { void handleDownloadProvO(); }}
         onOpenHelp={() => setIsHelpOpen(true)}
         onOpenSettings={() => setIsSettingsOpen(true)}
+        isClearingAll={isClearingAll}
+        isGeneratingProvenanceReport={isGeneratingProvenanceReport}
+        isDownloadingProvO={isDownloadingProvO}
       />
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
@@ -963,6 +1093,7 @@ const Index = () => {
                       selectedNode={selectedNode}
                       onNodeUpdate={onNodeUpdate}
                       onRemoveNode={handleRemoveNode}
+                      activeChatbotConfig={activeConfig}
                     />
                   ) : rightPanel === 'chat' ? (
                     <ChatPanel
@@ -1129,6 +1260,10 @@ const Index = () => {
                 <div>
                   <span className="font-medium text-foreground">Model:</span>{" "}
                   {activeConfig.model}
+                </div>
+                <div>
+                  <span className="font-medium text-foreground">Code generation:</span>{" "}
+                  {activeConfig.codegenModel?.trim() || "Not configured"}
                 </div>
                 <div className="truncate">
                   <span className="font-medium text-foreground">Base URL:</span>{" "}

@@ -8,9 +8,19 @@ import {
   PanelLeft,
   SlidersHorizontal,
   MessageSquare,
-  History
+  History,
+  Trash2,
+  FileText,
+  Braces,
+  ChevronDown
 } from 'lucide-react';
 import { Separator } from "@/components/ui/separator";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import inlumenLogo from "@/assets/inlumen-logo.svg";
 
@@ -27,8 +37,14 @@ interface ToolbarProps {
   onToggleInspector: () => void;
   onToggleChat: () => void;
   onToggleVersions: () => void;
+  onClearAll: () => void;
+  onGenerateProvenanceReport: () => void;
+  onDownloadProvO: () => void;
   onOpenHelp: () => void;
   onOpenSettings: () => void;
+  isClearingAll?: boolean;
+  isGeneratingProvenanceReport?: boolean;
+  isDownloadingProvO?: boolean;
 }
 
 export function Toolbar({
@@ -44,8 +60,14 @@ export function Toolbar({
   onToggleInspector,
   onToggleChat,
   onToggleVersions,
+  onClearAll,
+  onGenerateProvenanceReport,
+  onDownloadProvO,
   onOpenHelp,
-  onOpenSettings
+  onOpenSettings,
+  isClearingAll = false,
+  isGeneratingProvenanceReport = false,
+  isDownloadingProvO = false
 }: ToolbarProps) {
   const panelButtonClass = (isActive: boolean) =>
     cn(
@@ -127,10 +149,54 @@ export function Toolbar({
       </div>
       
       <div className="ml-auto flex shrink-0 items-center gap-1">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 text-xs text-destructive hover:text-destructive"
+          onClick={onClearAll}
+          disabled={isClearingAll}
+          title="Clear canvas, chat, and saved versions"
+        >
+          <Trash2 className="h-3.5 w-3.5 mr-1" />
+          <span className="hidden sm:inline">{isClearingAll ? "Clearing..." : "Clear all"}</span>
+        </Button>
+
         <Button variant="ghost" size="sm" className="h-8 text-xs" onClick={onOpenHelp}>
           <HelpCircle className="h-3.5 w-3.5 mr-1" />
           <span className="hidden sm:inline">Help</span>
         </Button>
+
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 text-xs"
+              disabled={isGeneratingProvenanceReport || isDownloadingProvO}
+              title="Download provenance"
+            >
+              <FileText className="h-3.5 w-3.5 mr-1" />
+              <span className="hidden sm:inline">
+                {isGeneratingProvenanceReport
+                  ? "Generating..."
+                  : isDownloadingProvO
+                    ? "Exporting..."
+                    : "Provenance"}
+              </span>
+              <ChevronDown className="ml-1 h-3 w-3" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={onGenerateProvenanceReport}>
+              <FileText className="mr-2 h-4 w-4" />
+              PDF report
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onDownloadProvO}>
+              <Braces className="mr-2 h-4 w-4" />
+              PROV-O (JSON-LD)
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
 
         <Button variant="ghost" size="sm" className="h-8 text-xs" onClick={onOpenSettings}>
           <Settings className="h-3.5 w-3.5 mr-1" />

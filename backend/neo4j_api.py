@@ -5,10 +5,16 @@ import uuid
 import json
 import os
 import tempfile
+from typing import Any
 from urllib.parse import quote
 from runtime_config import add_cors_headers, get_neo4j_settings
 from step_types import normalize_step_type
 from minio_access import create_bucket, list_objects, read_object_bytes, remove_object, upload_object
+from node_definitions.instance import (
+    definition_data_from_properties,
+    definition_properties_from_data,
+    normalize_definition_properties,
+)
 
 NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD = get_neo4j_settings()
 
@@ -160,6 +166,7 @@ def _parse_visible_graph(graph: dict) -> tuple[list[dict], list[dict]]:
             "x": x,
             "y": y,
         }
+        props.update(definition_properties_from_data(data))
         if step_type in ("input", "output"):
             props["content"] = str(data.get("content") or "")
             props["has_files"] = "yes" if files else str(data.get("has_files") or "no").lower().strip()
@@ -233,6 +240,8 @@ def _sync_graph_to_session(
 ) -> dict:
     nodes, edges = _parse_visible_graph(graph)
     pipeline_uid = _ensure_design_pipeline(session)
+    settings = graph.get("settings") if isinstance(graph.get("settings"), dict) else {}
+    settings_json = json.dumps(settings, ensure_ascii=False)
 
     if not nodes:
         deleted_ids = _clear_active_steps(session)
@@ -248,6 +257,7 @@ def _sync_graph_to_session(
             WHEN $active_version_uid IS NULL THEN p.active_version_uid
             ELSE $active_version_uid
           END
+        SET p.settings_json = $settings_json
         SET p.description = CASE
             WHEN $active_version_uid IS NULL THEN p.description
             ELSE coalesce(activeVersion.description, p.description, '')
@@ -256,7 +266,8 @@ def _sync_graph_to_session(
         """, pipeline_uid=pipeline_uid,
              version_name=version_name,
              active_version_uid=active_version_uid,
-             touch_pipeline_updated_at=touch_pipeline_updated_at).single()
+             touch_pipeline_updated_at=touch_pipeline_updated_at,
+             settings_json=settings_json).single()
         return {
             "ok": True,
             "pipeline_uid": pipeline_uid,
@@ -345,6 +356,7 @@ def _sync_graph_to_session(
         WHEN $active_version_uid IS NULL THEN p.active_version_uid
         ELSE $active_version_uid
       END
+    SET p.settings_json = $settings_json
     SET p.description = CASE
         WHEN $active_version_uid IS NULL THEN p.description
         ELSE coalesce(activeVersion.description, p.description, '')
@@ -353,7 +365,8 @@ def _sync_graph_to_session(
     """, pipeline_uid=pipeline_uid,
          version_name=version_name,
          active_version_uid=active_version_uid,
-         touch_pipeline_updated_at=touch_pipeline_updated_at).single()
+         touch_pipeline_updated_at=touch_pipeline_updated_at,
+         settings_json=settings_json).single()
 
     return {
         "ok": True,
@@ -700,6 +713,256 @@ def _upsert_pipeline_version_snapshot(
         )
     return record.data() if record else None
 
+
+def _empty_pipeline_graph(updated_at: str | None = None) -> dict:
+    graph = {
+        "nodes": [],
+        "edges": [],
+        "viewport": {"x": 0, "y": 0, "zoom": 1},
+    }
+    if updated_at is not None:
+        graph["updated_at"] = updated_at
+    return graph
+
+
+def _json_details(details: Any) -> str:
+    try:
+        return json.dumps(details or {}, ensure_ascii=False, default=str)
+    except Exception:
+        return json.dumps({"details": str(details)}, ensure_ascii=False)
+
+
+def _short_text(value: Any, limit: int = 4000) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _provenance_graph_snapshot(session, pipeline_uid: str) -> dict:
+    node_records = list(session.run("""
+    MATCH (p:PIPELINE {uid: $pipeline_uid})-[:HAS_STEP]->(step:STEP)
+    RETURN
+      toString(step.flow_id) AS id,
+      coalesce(step.label, '') AS label,
+      coalesce(step.type, 'custom') AS type,
+      coalesce(step.x, 0.0) AS x,
+      coalesce(step.y, 0.0) AS y
+    ORDER BY
+      CASE WHEN toString(step.flow_id) =~ '^[0-9]+$' THEN toInteger(step.flow_id) ELSE 2147483647 END,
+      toString(step.flow_id)
+    """, pipeline_uid=pipeline_uid))
+    edge_records = list(session.run("""
+    MATCH (p:PIPELINE {uid: $pipeline_uid})-[:HAS_STEP]->(source:STEP)-[:FLOWS_TO]->(target:STEP)
+    WHERE (p)-[:HAS_STEP]->(target)
+    RETURN toString(source.flow_id) AS source, toString(target.flow_id) AS target
+    ORDER BY source, target
+    """, pipeline_uid=pipeline_uid))
+
+    node_limit = 60
+    edge_limit = 120
+    return {
+        "node_count": len(node_records),
+        "edge_count": len(edge_records),
+        "nodes": [
+            {
+                "id": record["id"],
+                "label": _short_text(record["label"], 80),
+                "type": record["type"],
+                "x": float(record["x"] or 0.0),
+                "y": float(record["y"] or 0.0),
+            }
+            for record in node_records[:node_limit]
+        ],
+        "edges": [
+            {
+                "source": record["source"],
+                "target": record["target"],
+            }
+            for record in edge_records[:edge_limit]
+        ],
+        "truncated": len(node_records) > node_limit or len(edge_records) > edge_limit,
+    }
+
+
+def _provenance_graph_snapshot_from_graph(graph: dict) -> dict:
+    nodes, edges = _parse_visible_graph(graph)
+    node_limit = 60
+    edge_limit = 120
+    return {
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "nodes": [
+            {
+                "id": node["props"]["flow_id"],
+                "label": _short_text(node["props"].get("label"), 80),
+                "type": node["props"].get("type", "custom"),
+                "x": float(node["props"].get("x") or 0.0),
+                "y": float(node["props"].get("y") or 0.0),
+            }
+            for node in nodes[:node_limit]
+        ],
+        "edges": [
+            {
+                "source": edge["source"],
+                "target": edge["target"],
+            }
+            for edge in edges[:edge_limit]
+        ],
+        "truncated": len(nodes) > node_limit or len(edges) > edge_limit,
+    }
+
+
+def _active_pipeline_version(session, version_uid: str | None = None, version_name: str | None = None) -> dict:
+    pipeline_uid = _ensure_design_pipeline(session)
+    record = session.run("""
+    MATCH (p:PIPELINE {uid: $pipeline_uid})
+    OPTIONAL MATCH (p)-[:HAS_VERSION]->(activeVersion:PIPELINE_VERSION {uid: coalesce(p.active_version_uid, $main_uid)})
+    RETURN
+      p.uid AS pipeline_uid,
+      coalesce(p.name, p.label, '') AS pipeline_name,
+      coalesce(p.label, p.name, '') AS pipeline_label,
+      coalesce(p.active_version_uid, $main_uid) AS active_version_uid,
+      CASE
+        WHEN coalesce(p.active_version_uid, $main_uid) = $main_uid THEN $main_name
+        ELSE coalesce(activeVersion.name, p.version, $main_name)
+      END AS active_version_name
+    """, pipeline_uid=pipeline_uid,
+         main_uid=MAIN_VERSION_UID,
+         main_name=MAIN_VERSION_NAME).single()
+    resolved_uid = (version_uid or (record["active_version_uid"] if record else MAIN_VERSION_UID) or MAIN_VERSION_UID)
+    resolved_name = version_name or (
+        MAIN_VERSION_NAME
+        if resolved_uid == MAIN_VERSION_UID
+        else (record["active_version_name"] if record else MAIN_VERSION_NAME)
+    )
+    return {
+        "pipeline_uid": pipeline_uid,
+        "pipeline_name": record["pipeline_name"] if record else "",
+        "pipeline_label": record["pipeline_label"] if record else "",
+        "version_uid": str(resolved_uid),
+        "version_name": str(resolved_name or MAIN_VERSION_NAME),
+    }
+
+
+def _record_provenance_event(
+    session,
+    action: str,
+    actor: str,
+    summary: str,
+    details: Any = None,
+    *,
+    version_uid: str | None = None,
+    version_name: str | None = None,
+) -> None:
+    context = _active_pipeline_version(session, version_uid, version_name)
+    if isinstance(details, dict):
+        event_details = dict(details)
+    elif details is None:
+        event_details = {}
+    else:
+        event_details = {"details": details}
+    event_details["graph_snapshot"] = _provenance_graph_snapshot(
+        session,
+        context["pipeline_uid"],
+    )
+    details_json = _json_details(event_details)
+    session.run("""
+    MATCH (p:PIPELINE {uid: $pipeline_uid})
+    MERGE (v:PIPELINE_VERSION {uid: $version_uid})
+    ON CREATE SET v.created_at = datetime(),
+                  v.version_index = CASE WHEN $version_uid = $main_uid THEN 0 ELSE null END,
+                  v.is_main = CASE WHEN $version_uid = $main_uid THEN true ELSE false END
+    SET v.name = CASE
+          WHEN $version_uid = $main_uid THEN $main_name
+          ELSE coalesce(v.name, $version_name)
+        END,
+        v.version = CASE
+          WHEN $version_uid = $main_uid THEN $main_name
+          ELSE coalesce(v.version, $version_name)
+        END,
+        v.updated_at = coalesce(v.updated_at, datetime())
+    MERGE (p)-[:HAS_VERSION]->(v)
+    CREATE (event:PROVENANCE_EVENT {
+      uid: randomUUID(),
+      pipeline_uid: $pipeline_uid,
+      version_uid: $version_uid,
+      version_name: $version_name,
+      actor: $actor,
+      action: $action,
+      summary: $summary,
+      details_json: $details_json,
+      created_at: datetime()
+    })
+    MERGE (p)-[:HAS_PROVENANCE]->(event)
+    MERGE (v)-[:HAS_PROVENANCE]->(event)
+    """, pipeline_uid=context["pipeline_uid"],
+         version_uid=context["version_uid"],
+         version_name=context["version_name"],
+         main_uid=MAIN_VERSION_UID,
+         main_name=MAIN_VERSION_NAME,
+         actor=str(actor or "system"),
+         action=str(action or "change"),
+         summary=str(summary or "Pipeline graph was modified."),
+         details_json=details_json)
+
+
+def _copy_provenance_to_version(session, source_version_uid: str, target_version_uid: str) -> None:
+    if not source_version_uid or not target_version_uid or source_version_uid == target_version_uid:
+        return
+    session.run("""
+    MATCH (source:PIPELINE_VERSION {uid: $source_version_uid})
+    MATCH (target:PIPELINE_VERSION {uid: $target_version_uid})
+    OPTIONAL MATCH (source)-[:HAS_PROVENANCE]->(event:PROVENANCE_EVENT)
+    WITH target, collect(event) AS events
+    FOREACH (event IN events |
+      MERGE (target)-[:HAS_PROVENANCE]->(event)
+    )
+    """, source_version_uid=source_version_uid, target_version_uid=target_version_uid)
+
+
+def _clear_pipeline_provenance(session, pipeline_uid: str) -> int:
+    record = session.run("""
+    MATCH (p:PIPELINE {uid: $pipeline_uid})-[:HAS_PROVENANCE]->(event:PROVENANCE_EVENT)
+    RETURN count(DISTINCT event) AS deleted_count
+    """, pipeline_uid=pipeline_uid).single()
+    deleted_count = int(record["deleted_count"] if record and record["deleted_count"] is not None else 0)
+    session.run("""
+    MATCH (p:PIPELINE {uid: $pipeline_uid})-[:HAS_PROVENANCE]->(event:PROVENANCE_EVENT)
+    WITH DISTINCT event
+    DETACH DELETE event
+    """, pipeline_uid=pipeline_uid)
+    return deleted_count
+
+
+def _event_details(record) -> dict:
+    raw = record["details_json"] if record and record["details_json"] else "{}"
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {"details": value}
+    except Exception:
+        return {"details": raw}
+
+
+def _mutation_query_type(query_type: str | None) -> bool:
+    return str(query_type or "") in {
+        "create_pipeline",
+        "create_step",
+        "insert_initial_step",
+        "insert_between_steps",
+        "delete_step",
+        "delete_all_steps",
+    }
+
+
+def _provenance_context_from_payload(data: dict) -> dict:
+    context = data.get("provenance_context")
+    if not isinstance(context, dict):
+        return {}
+    return {
+        "user_query": _short_text(context.get("user_query"), 2000),
+        "session_id": _short_text(context.get("session_id"), 120),
+    }
+
+
 # Apply the CORS function to all routes using the after_request decorator
 @app.after_request
 def apply_cors(response):
@@ -725,6 +988,7 @@ def neo4j_add_node():
         properties.pop("position", None)
     properties.setdefault("x", 0)
     properties.setdefault("y", 0)
+    normalize_definition_properties(properties)
     # Normalize to floats (Neo4j-friendly)
     try:
         properties["x"] = float(properties.get("x", 0) or 0)
@@ -799,6 +1063,20 @@ def neo4j_add_node():
         with driver.session() as session:
             result = session.run(query, {"props": properties})
             record = result.single()
+            if record:
+                step = record["n"]._properties
+                _record_provenance_event(
+                    session,
+                    "node_created",
+                    "manual",
+                    f"Created {step.get('type', 'custom')} step '{step.get('label', '')}'.",
+                    {
+                        "flow_id": step.get("flow_id"),
+                        "label": step.get("label"),
+                        "type": step.get("type"),
+                        "description": step.get("description"),
+                    },
+                )
             return jsonify(record["n"]._properties), 200
     except Exception as e:
         print("[neo4j_api.py] Error executing Neo4j query:", e)
@@ -832,6 +1110,14 @@ def neo4j_add_file():
         with driver.session() as session:
             result = session.run(query, {"flow_id": flow_id, "filename": filename})
             record = result.single()
+            if record:
+                _record_provenance_event(
+                    session,
+                    "file_added",
+                    "manual",
+                    f"Added file '{filename}' to step {flow_id}.",
+                    {"flow_id": flow_id, "filename": filename},
+                )
             return jsonify(record["n"]._properties), 200
     except Exception as e:
         print("[neo4j_api.py] Error executing Neo4j query:", e)
@@ -865,6 +1151,14 @@ def neo4j_delete_file():
         with driver.session() as session:
             result = session.run(query, {"flow_id": flow_id, "filename": filename})
             record = result.single()
+            if record:
+                _record_provenance_event(
+                    session,
+                    "file_removed",
+                    "manual",
+                    f"Removed file '{filename}' from step {flow_id}.",
+                    {"flow_id": flow_id, "filename": filename},
+                )
             return jsonify(record["n"]._properties), 200
     except Exception as e:
         print("[neo4j_api.py] Error executing Neo4j query:", e)
@@ -884,6 +1178,7 @@ def neo4j_update_node():
     # Changes in label/description
     properties["label"] = properties.get("label", "")
     properties["description"] = properties.get("description", "")
+    normalize_definition_properties(properties)
     # Changes specific to config step type:
     if step_type == "config":
         # Convert param dict -> JSON string
@@ -928,9 +1223,63 @@ def neo4j_update_node():
             record = result.single()
             if not record:
                 return jsonify({"error": f"[neo4j_api.py] No STEP node found with flow_id={flow_id}"}), 404
+            step = record["n"]._properties
+            _record_provenance_event(
+                session,
+                "node_updated",
+                "manual",
+                f"Updated step {flow_id} '{step.get('label', '')}'.",
+                {
+                    "flow_id": flow_id,
+                    "label": step.get("label"),
+                    "type": step.get("type"),
+                    "updated_properties": sorted(properties.keys()),
+                },
+            )
             return jsonify(record["n"]._properties), 200
     except Exception as e:
         print("[neo4j_api.py] Error executing Neo4j query:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/neo4j_update_generated_artifact', methods=['POST'])
+@require_auth
+def neo4j_update_generated_artifact():
+    data = request.get_json(silent=True) or {}
+    flow_id = str(data.get("flow_id") or "").strip()
+    generated_artifact = data.get("generated_artifact")
+    if not flow_id:
+        return jsonify({"error": "flow_id is required"}), 400
+    if not isinstance(generated_artifact, dict):
+        return jsonify({"error": "generated_artifact must be an object"}), 400
+
+    query = """
+    MATCH (n:STEP {flow_id: $flow_id})
+    OPTIONAL MATCH (p:PIPELINE)-[:HAS_STEP]->(n)
+    SET n.generated_artifact_json = $generated_artifact_json
+    SET p.updated_at = datetime()
+    RETURN n
+    """
+    try:
+        with driver.session() as session:
+            record = session.run(
+                query,
+                {
+                    "flow_id": flow_id,
+                    "generated_artifact_json": json.dumps(
+                        generated_artifact,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                },
+            ).single()
+            if not record:
+                return jsonify(
+                    {"error": f"No STEP node found with flow_id={flow_id}"}
+                ), 404
+            return jsonify(record["n"]._properties), 200
+    except Exception as e:
+        print("[neo4j_api.py] Error storing generated artifact:", e)
         return jsonify({"error": str(e)}), 500
     
 # Deletes all nodes and edges, returns STEP flow_ids deleted
@@ -948,6 +1297,13 @@ def neo4j_clear_nodes():
                 MATCH (p:PIPELINE {status:'design'})
                 SET p.updated_at = datetime()
                 """)
+            _record_provenance_event(
+                session,
+                "graph_cleared",
+                "manual",
+                f"Cleared {len(flow_ids)} step(s) from the canvas.",
+                {"deleted_step_flow_ids": flow_ids},
+            )
         return jsonify({
             "status": "ok",
             "message": "All nodes deleted",
@@ -955,6 +1311,70 @@ def neo4j_clear_nodes():
         }), 200
     except Exception as e:
         print("[neo4j_api.py] Error clearing Neo4j:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/neo4j_clear_pipeline_workspace', methods=['POST', 'OPTIONS'])
+@require_auth
+def neo4j_clear_pipeline_workspace():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    print("[neo4j_api.py] Clearing pipeline workspace, preserving Main.")
+    try:
+        with driver.session() as session:
+            pipeline_uid = _ensure_design_pipeline(session)
+            deleted_step_flow_ids = _clear_active_steps(session)
+
+            deleted_version_record = session.run("""
+            MATCH (p:PIPELINE {uid: $pipeline_uid})-[:HAS_VERSION]->(v:PIPELINE_VERSION)
+            WHERE coalesce(v.is_main, false) = false AND v.uid <> $main_uid
+            RETURN collect(toString(v.uid)) AS uids
+            """, pipeline_uid=pipeline_uid, main_uid=MAIN_VERSION_UID).single()
+            deleted_version_uids = (
+                deleted_version_record["uids"]
+                if deleted_version_record and deleted_version_record["uids"]
+                else []
+            )
+            for version_uid in deleted_version_uids:
+                _delete_version_file_snapshots(version_uid)
+
+            session.run("""
+            MATCH (p:PIPELINE {uid: $pipeline_uid})-[:HAS_VERSION]->(v:PIPELINE_VERSION)
+            WHERE coalesce(v.is_main, false) = false AND v.uid <> $main_uid
+            DETACH DELETE v
+            """, pipeline_uid=pipeline_uid, main_uid=MAIN_VERSION_UID).single()
+
+            sync_result = _sync_graph_to_session(
+                session,
+                _empty_pipeline_graph(),
+                version_name=MAIN_VERSION_NAME,
+                active_version_uid=MAIN_VERSION_UID,
+            )
+            main_version = _upsert_main_pipeline_version(
+                session,
+                pipeline_uid,
+                _empty_pipeline_graph(),
+                sync_result.get("updated_at"),
+                description="",
+            )
+            graph = _empty_pipeline_graph(
+                main_version.get("updated_at") if isinstance(main_version, dict) else sync_result.get("updated_at")
+            )
+            deleted_provenance_event_count = _clear_pipeline_provenance(session, pipeline_uid)
+
+        return jsonify({
+            "status": "ok",
+            "message": "Pipeline workspace cleared",
+            "deleted_step_flow_ids": deleted_step_flow_ids,
+            "deleted_version_uids": deleted_version_uids,
+            "deleted_version_count": len(deleted_version_uids),
+            "deleted_provenance_event_count": deleted_provenance_event_count,
+            "provenance_cleared": True,
+            "version": main_version,
+            "graph": graph,
+        }), 200
+    except Exception as e:
+        print("[neo4j_api.py] Error clearing pipeline workspace:", e)
         return jsonify({"error": str(e)}), 500
 
 # Deletes one STEP node and edges:
@@ -1008,6 +1428,13 @@ def neo4j_delete_node(flow_id):
                 MATCH (p:PIPELINE {status:'design'})
                 SET p.updated_at = datetime()
                 """)
+            _record_provenance_event(
+                session,
+                "node_deleted",
+                "manual",
+                f"Deleted step {flow_id}.",
+                {"flow_id": flow_id},
+            )
         return jsonify({"status": "ok", "deleted": flow_id}), 200
     except Exception as e:
         print("[neo4j_api.py] Delete error:", e)
@@ -1043,6 +1470,13 @@ def neo4j_add_edge():
             }).single()
             if not record:
                 return jsonify({"error": "STEP node(s) not found for given flow_id(s)"}), 404
+            _record_provenance_event(
+                session,
+                "edge_created",
+                "manual",
+                f"Connected step {from_flow_id} to step {to_flow_id}.",
+                {"from_flow_id": from_flow_id, "to_flow_id": to_flow_id},
+            )
             return jsonify({
                 "from_flow_id": record["from_flow_id"],
                 "to_flow_id": record["to_flow_id"],
@@ -1083,6 +1517,13 @@ def neo4j_delete_edge():
             }).single()
             if not record:
                 return jsonify({"error": "STEP node(s) not found for given flow_id(s)"}), 404
+            _record_provenance_event(
+                session,
+                "edge_deleted",
+                "manual",
+                f"Removed connection from step {from_flow_id} to step {to_flow_id}.",
+                {"from_flow_id": from_flow_id, "to_flow_id": to_flow_id},
+            )
             return jsonify({
                 "from_flow_id": record["from_flow_id"],
                 "to_flow_id": record["to_flow_id"],
@@ -1242,6 +1683,18 @@ def neo4j_update_pipeline_overview():
                     active_version_uid,
                     record["updated_at"],
                 )
+                _record_provenance_event(
+                    session,
+                    "overview_updated",
+                    "manual",
+                    f"Updated pipeline overview for version '{record['version']}'.",
+                    {
+                        "version": record["version"],
+                        "description": record["description"],
+                    },
+                    version_uid=record["active_version_uid"],
+                    version_name=record["version"],
+                )
 
             return jsonify(record.data() if record else {
                 "version": version_name,
@@ -1335,6 +1788,11 @@ def neo4j_save_pipeline_version():
             version_name = str(payload.get("name") or "").strip() or _default_pipeline_version_name(session)
             version_uid = str(uuid.uuid4())
             pipeline_uid = _ensure_design_pipeline(session)
+            active_record = session.run("""
+            MATCH (p:PIPELINE {uid: $pipeline_uid})
+            RETURN coalesce(p.active_version_uid, $main_uid) AS active_version_uid
+            """, pipeline_uid=pipeline_uid, main_uid=MAIN_VERSION_UID).single()
+            source_version_uid = active_record["active_version_uid"] if active_record else MAIN_VERSION_UID
             graph_with_metadata = _graph_with_metadata(graph, graph.get("updated_at"))
             nodes = graph_with_metadata.get("nodes") if isinstance(graph_with_metadata.get("nodes"), list) else []
             edges = graph_with_metadata.get("edges") if isinstance(graph_with_metadata.get("edges"), list) else []
@@ -1388,6 +1846,22 @@ def neo4j_save_pipeline_version():
                     version_uid,
                     record["updated_at"],
                     graph_with_metadata,
+                )
+                _copy_provenance_to_version(session, source_version_uid, version_uid)
+                _record_provenance_event(
+                    session,
+                    "version_saved",
+                    "manual",
+                    f"Saved pipeline snapshot as version '{version_name}'.",
+                    {
+                        "source_version_uid": source_version_uid,
+                        "new_version_uid": version_uid,
+                        "node_count": len(nodes),
+                        "edge_count": len(edges),
+                        "file_count": file_count,
+                    },
+                    version_uid=version_uid,
+                    version_name=version_name,
                 )
             return jsonify({"version": record.data() if record else None}), 200
     except Exception as e:
@@ -1531,6 +2005,15 @@ def neo4j_restore_pipeline_version():
                 "updated_at": record["updated_at"],
                 "pipeline_updated_at": sync_result.get("updated_at"),
             }
+            _record_provenance_event(
+                session,
+                "version_restored",
+                "manual",
+                f"Restored version '{record['name']}' to the canvas.",
+                {"version_uid": record["uid"], "version_name": record["name"]},
+                version_uid=record["uid"],
+                version_name=record["name"],
+            )
             return jsonify({"version": version, "graph": graph, "file_restore": file_restore}), 200
     except Exception as e:
         print("[neo4j_api.py] Error restoring pipeline version:", e)
@@ -1611,6 +2094,16 @@ def neo4j_set_pipeline_version_as_main():
                 "created_at": record["created_at"],
                 "updated_at": record["updated_at"],
             }
+            _copy_provenance_to_version(session, record["uid"], MAIN_VERSION_UID)
+            _record_provenance_event(
+                session,
+                "main_version_updated",
+                "manual",
+                f"Promoted version '{record['name']}' to Main.",
+                {"source_version_uid": record["uid"], "source_version_name": record["name"]},
+                version_uid=MAIN_VERSION_UID,
+                version_name=MAIN_VERSION_NAME,
+            )
             return jsonify({
                 "version": main_version,
                 "source_version": source_version,
@@ -1686,6 +2179,17 @@ def neo4j_delete_pipeline_version():
             """, version_uid=version_uid, main_uid=MAIN_VERSION_UID).single()
             if not record:
                 return jsonify({"error": f"Pipeline version not found: {version_uid}"}), 404
+            _record_provenance_event(
+                session,
+                "version_deleted",
+                "manual",
+                f"Deleted saved version '{record['deleted_name']}'.",
+                {
+                    "deleted_uid": version_uid,
+                    "deleted_name": record["deleted_name"],
+                    "remaining_count": record["remaining_count"],
+                },
+            )
             return jsonify({
                 "deleted_uid": version_uid,
                 "deleted_name": record["deleted_name"],
@@ -1697,17 +2201,169 @@ def neo4j_delete_pipeline_version():
         print("[neo4j_api.py] Error deleting pipeline version:", e)
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/neo4j_get_provenance_events', methods=['GET'])
+@require_auth
+def neo4j_get_provenance_events():
+    requested_version_uid = str(request.args.get("version_uid") or "").strip()
+    try:
+        with driver.session() as session:
+            if not _label_exists(session, "PIPELINE"):
+                return jsonify({
+                    "pipeline": None,
+                    "version": {"uid": requested_version_uid or MAIN_VERSION_UID, "name": MAIN_VERSION_NAME},
+                    "events": [],
+                }), 200
+
+            pipeline_record = session.run("""
+            MATCH (candidate:PIPELINE {status:'design'})
+            OPTIONAL MATCH (candidate)-[:HAS_STEP]->(candidateStep:STEP)
+            WITH candidate, count(candidateStep) AS step_count
+            ORDER BY step_count DESC, candidate.updated_at DESC
+            WITH collect(candidate)[0] AS p
+            RETURN
+              p.uid AS uid,
+              coalesce(p.name, '') AS name,
+              coalesce(p.label, '') AS label,
+              coalesce(p.active_version_uid, $main_uid) AS active_version_uid,
+              toString(p.created_at) AS created_at,
+              toString(p.updated_at) AS updated_at
+            """, main_uid=MAIN_VERSION_UID).single()
+            if not pipeline_record:
+                return jsonify({
+                    "pipeline": None,
+                    "version": {"uid": requested_version_uid or MAIN_VERSION_UID, "name": MAIN_VERSION_NAME},
+                    "events": [],
+                }), 200
+
+            version_uid = requested_version_uid or pipeline_record["active_version_uid"] or MAIN_VERSION_UID
+            version_record = session.run("""
+            MATCH (p:PIPELINE {uid: $pipeline_uid})
+            OPTIONAL MATCH (p)-[:HAS_VERSION]->(v:PIPELINE_VERSION {uid: $version_uid})
+            RETURN
+              coalesce(v.uid, $version_uid) AS uid,
+              CASE WHEN coalesce(v.uid, $version_uid) = $main_uid THEN $main_name ELSE coalesce(v.name, $main_name) END AS name,
+              coalesce(v.description, '') AS description,
+              toString(v.created_at) AS created_at,
+              toString(v.updated_at) AS updated_at,
+              v.graph_json AS graph_json
+            """, pipeline_uid=pipeline_record["uid"],
+                 version_uid=version_uid,
+                 main_uid=MAIN_VERSION_UID,
+                 main_name=MAIN_VERSION_NAME).single()
+
+            version_payload = version_record.data() if version_record else {
+                "uid": version_uid,
+                "name": MAIN_VERSION_NAME if version_uid == MAIN_VERSION_UID else version_uid,
+            }
+            graph_json = version_payload.pop("graph_json", None)
+            try:
+                version_graph = json.loads(graph_json or "{}")
+            except (TypeError, ValueError):
+                version_graph = {}
+            if isinstance(version_graph, dict) and (
+                isinstance(version_graph.get("nodes"), list)
+                or isinstance(version_graph.get("edges"), list)
+            ):
+                current_graph_snapshot = _provenance_graph_snapshot_from_graph(version_graph)
+            elif version_uid == pipeline_record["active_version_uid"]:
+                current_graph_snapshot = _provenance_graph_snapshot(session, pipeline_record["uid"])
+            else:
+                current_graph_snapshot = _provenance_graph_snapshot_from_graph({})
+
+            events = []
+            if _label_exists(session, "PROVENANCE_EVENT"):
+                result = session.run("""
+                MATCH (:PIPELINE_VERSION {uid: $version_uid})-[:HAS_PROVENANCE]->(event:PROVENANCE_EVENT)
+                RETURN
+                  event.uid AS uid,
+                  event.actor AS actor,
+                  event.action AS action,
+                  event.summary AS summary,
+                  event.details_json AS details_json,
+                  event.version_uid AS version_uid,
+                  event.version_name AS version_name,
+                  toString(event.created_at) AS created_at
+                ORDER BY event.created_at ASC, event.uid ASC
+                """, version_uid=version_uid)
+                for record in result:
+                    events.append({
+                        "uid": record["uid"],
+                        "actor": record["actor"],
+                        "action": record["action"],
+                        "summary": record["summary"],
+                        "details": _event_details(record),
+                        "version_uid": record["version_uid"],
+                        "version_name": record["version_name"],
+                        "created_at": record["created_at"],
+                    })
+
+            return jsonify({
+                "pipeline": {
+                    "uid": pipeline_record["uid"],
+                    "name": pipeline_record["name"],
+                    "label": pipeline_record["label"],
+                    "active_version_uid": pipeline_record["active_version_uid"],
+                    "created_at": pipeline_record["created_at"],
+                    "updated_at": pipeline_record["updated_at"],
+                },
+                "version": version_payload,
+                "events": events,
+                "current_graph_snapshot": current_graph_snapshot,
+            }), 200
+    except Exception as e:
+        print("[neo4j_api.py] Error loading provenance events:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/neo4j_record_provenance_event', methods=['POST', 'OPTIONS'])
+@require_auth
+def neo4j_record_provenance_event():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    payload = request.get_json(force=True) or {}
+    try:
+        with driver.session() as session:
+            _record_provenance_event(
+                session,
+                str(payload.get("action") or "change"),
+                str(payload.get("actor") or "system"),
+                str(payload.get("summary") or "Pipeline graph was modified."),
+                payload.get("details") if isinstance(payload.get("details"), dict) else {},
+                version_uid=str(payload.get("version_uid") or "").strip() or None,
+                version_name=str(payload.get("version_name") or "").strip() or None,
+            )
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        print("[neo4j_api.py] Error recording provenance event:", e)
+        return jsonify({"error": str(e)}), 500
+
 # (Internal) Run query by LLM
 @app.route('/neo4j_run_query', methods=['POST'])
 @require_auth
 def neo4j_run_query():
     data = request.json
     query = data['query']
+    query_type = data.get("query_type")
     print("[neo4j_api.py] Received query to execute in Neo4J:", query)
     with driver.session() as session:
         session_result = session.run(query)
         # We are assuming that the query returns something to jsonify
         results = [record.data() for record in session_result]
+        if _mutation_query_type(query_type):
+            provenance_context = _provenance_context_from_payload(data)
+            details = {
+                "query_type": query_type,
+                **provenance_context,
+                "result": _short_text(results, 2000),
+            }
+            _record_provenance_event(
+                session,
+                str(query_type),
+                "agent",
+                f"Agent executed pipeline operation '{query_type}'.",
+                details,
+            )
         return jsonify(results)
 
 @app.route("/neo4j_update_node_position", methods=["POST"])
@@ -1731,6 +2387,13 @@ def neo4j_update_node_position():
     try:
         with driver.session() as session:
             session.run(query, flow_id=flow_id, x=x, y=y)
+            _record_provenance_event(
+                session,
+                "node_moved",
+                "manual",
+                f"Moved step {flow_id} on the canvas.",
+                {"flow_id": flow_id, "x": x, "y": y},
+            )
         return jsonify({"ok": True}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1771,7 +2434,55 @@ def neo4j_sync_graph():
     except Exception as e:
         print("[neo4j_api.py] Error syncing visible graph:", e)
         return jsonify({"error": str(e)}), 500
-    
+
+
+@app.route('/neo4j_restore_graph_history', methods=['POST', 'OPTIONS'])
+@require_auth
+def neo4j_restore_graph_history():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    payload = request.get_json(force=True) or {}
+    graph = payload.get("graph") if isinstance(payload.get("graph"), dict) else {}
+    direction = str(payload.get("direction") or "").strip().lower()
+    if direction not in {"undo", "redo"}:
+        return jsonify({"error": "direction must be 'undo' or 'redo'"}), 400
+    details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+
+    try:
+        with driver.session() as session:
+            def restore_history(tx):
+                result = _sync_graph_to_session(tx, graph)
+                action = f"{direction}_applied"
+                summary = (
+                    "Restored the previous graph snapshot with Undo."
+                    if direction == "undo"
+                    else "Restored the next graph snapshot with Redo."
+                )
+                _record_provenance_event(
+                    tx,
+                    action,
+                    "manual",
+                    summary,
+                    {
+                        **details,
+                        "direction": direction,
+                        "restored_node_count": result.get("node_count", 0),
+                        "restored_edge_count": result.get("edge_count", 0),
+                    },
+                )
+                return result, action
+
+            result, action = session.execute_write(restore_history)
+        return jsonify({
+            **result,
+            "provenance_action": action,
+        }), 200
+    except Exception as e:
+        print("[neo4j_api.py] Error restoring graph history:", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/neo4j_get_graph', methods=['GET'])
 @require_auth
 def neo4j_get_graph():
@@ -1805,6 +2516,7 @@ def neo4j_get_graph():
         .description,
         .version,
         .active_version_uid,
+        .settings_json,
         .status,
         created_at: toString(p.created_at),
         updated_at: toString(p.updated_at)
@@ -1841,7 +2553,15 @@ def neo4j_get_graph():
 
             updated_at = record["updated_at"]
             pipeline = record["pipeline"] or {}
+            settings = {}
             if isinstance(pipeline, dict):
+                settings_json = pipeline.get("settings_json")
+                if isinstance(settings_json, str) and settings_json.strip():
+                    try:
+                        parsed_settings = json.loads(settings_json)
+                        settings = parsed_settings if isinstance(parsed_settings, dict) else {}
+                    except Exception:
+                        settings = {}
                 pipeline["design_pipeline_count"] = record["design_pipeline_count"]
                 pipeline["step_count"] = record["pipeline_step_count"]
                 active_version_uid = pipeline.get("active_version_uid")
@@ -1915,6 +2635,7 @@ def neo4j_get_graph():
                     except Exception:
                         parsed_param = {}
                     data["param"] = parsed_param if isinstance(parsed_param, dict) else {}
+                data.update(definition_data_from_properties(props))
 
                 nodes.append({
                     "id": node_id,
@@ -1942,6 +2663,7 @@ def neo4j_get_graph():
             return jsonify({
                 "updated_at": updated_at,
                 "pipeline": pipeline,
+                "settings": settings,
                 "nodes": nodes,
                 "edges": edges,
                 "viewport": {"x": 0, "y": 0, "zoom": 1}

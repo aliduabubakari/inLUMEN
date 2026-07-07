@@ -1391,6 +1391,9 @@ def build_openapi_schema() -> dict[str, Any]:
                         "image": {"type": "string"},
                         "command": {"type": "array", "items": {"type": "string"}},
                         "files": {"type": "array", "items": {"type": "string"}},
+                        "generator": {"type": "string"},
+                        "configuration_hash": {"type": "string"},
+                        "build_manifest": {"type": "string"},
                     },
                 },
                 "DockerfileArtifactsResponse": {
@@ -1403,6 +1406,14 @@ def build_openapi_schema() -> dict[str, Any]:
                         "dockerfiles": {
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/DockerfileArtifact"},
+                        },
+                        "runtime_artifacts": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                        },
+                        "deployment_files": {
+                            "type": "array",
+                            "items": {"type": "object"},
                         },
                         "guardrails": {
                             "type": "object",
@@ -1606,6 +1617,18 @@ def _ui_api_openapi_paths(
                 },
             },
         },
+        "/api/pipeline/history/restore": {
+            "post": {
+                "tags": ["Pipeline State"],
+                "summary": "Restore an Undo or Redo snapshot and record one provenance event",
+                "operationId": "restorePipelineGraphHistory",
+                "requestBody": _json_request("#/components/schemas/PipelineHistoryRestoreRequest"),
+                "responses": {
+                    "200": _json_response("#/components/schemas/AnyObject"),
+                    **protected_responses,
+                },
+            },
+        },
         "/api/pipeline/overview": {
             "get": {
                 "tags": ["Pipeline State"],
@@ -1693,6 +1716,72 @@ def _ui_api_openapi_paths(
                 "requestBody": _json_request("#/components/schemas/PipelineVersionUidRequest"),
                 "responses": {
                     "200": _json_response("#/components/schemas/PipelineVersionRestoreResponse"),
+                    **protected_responses,
+                },
+            },
+        },
+        "/api/workspace/clear-all": {
+            "post": {
+                "tags": ["Pipeline State"],
+                "summary": "Clear Main, delete non-main versions, reset the chat session, and clean provenance",
+                "operationId": "clearPipelineWorkspace",
+                "requestBody": _json_request("#/components/schemas/WorkspaceClearAllRequest"),
+                "responses": {
+                    "200": _json_response("#/components/schemas/WorkspaceClearAllResponse"),
+                    **protected_responses,
+                },
+            },
+        },
+        "/api/provenance/report": {
+            "get": {
+                "tags": ["Pipeline State"],
+                "summary": "Download a PDF provenance report for a pipeline version",
+                "operationId": "downloadProvenanceReport",
+                "parameters": [
+                    {
+                        "name": "version_uid",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Pipeline version uid. Defaults to the active version.",
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "PDF provenance report.",
+                        "content": {
+                            "application/pdf": {
+                                "schema": {"type": "string", "format": "binary"}
+                            }
+                        },
+                    },
+                    **protected_responses,
+                },
+            },
+        },
+        "/api/provenance/prov-o": {
+            "get": {
+                "tags": ["Pipeline State"],
+                "summary": "Download PROV-O provenance as JSON-LD for a pipeline version",
+                "operationId": "downloadProvOProvenance",
+                "parameters": [
+                    {
+                        "name": "version_uid",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Pipeline version uid. Defaults to the active version.",
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "PROV-O JSON-LD provenance document.",
+                        "content": {
+                            "application/ld+json": {
+                                "schema": {"type": "object", "additionalProperties": True}
+                            }
+                        },
+                    },
                     **protected_responses,
                 },
             },
@@ -1982,6 +2071,8 @@ def _ui_api_openapi_schemas() -> dict[str, Any]:
                 "name": {"type": "string"},
                 "provider": {"type": "string"},
                 "model": {"type": "string"},
+                "codegenModel": {"type": "string"},
+                "codegen_model": {"type": "string"},
                 "baseUrl": {"type": "string"},
                 "base_url": {"type": "string"},
                 "system_prompt": {"type": "string"},
@@ -1998,6 +2089,8 @@ def _ui_api_openapi_schemas() -> dict[str, Any]:
                 "name": {"type": "string"},
                 "provider": {"type": "string"},
                 "model": {"type": "string"},
+                "codegenModel": {"type": "string"},
+                "codegen_model": {"type": "string"},
                 "baseUrl": {"type": "string"},
                 "base_url": {"type": "string"},
                 "system_prompt": {"type": "string"},
@@ -2131,6 +2224,16 @@ def _ui_api_openapi_schemas() -> dict[str, Any]:
                 "active_version_uid": {"type": "string"},
             },
         },
+        "PipelineHistoryRestoreRequest": {
+            "type": "object",
+            "required": ["graph", "direction"],
+            "properties": {
+                "graph": {"$ref": "#/components/schemas/ReactFlowGraph"},
+                "direction": {"type": "string", "enum": ["undo", "redo"]},
+                "details": {"type": "object", "additionalProperties": True},
+            },
+            "additionalProperties": False,
+        },
         "UiPipelineVersionSummary": {
             "type": "object",
             "required": ["uid", "name"],
@@ -2204,6 +2307,30 @@ def _ui_api_openapi_schemas() -> dict[str, Any]:
                 "deleted_uid": {"type": "string"},
                 "remaining_count": {"type": "integer"},
                 "pipeline_updated_at": {"type": "string", "nullable": True},
+            },
+            "additionalProperties": True,
+        },
+        "WorkspaceClearAllRequest": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "nullable": True},
+            },
+        },
+        "WorkspaceClearAllResponse": {
+            "type": "object",
+            "required": ["version", "graph"],
+            "properties": {
+                "status": {"type": "string"},
+                "message": {"type": "string"},
+                "deleted_step_flow_ids": {"type": "array", "items": {"type": "string"}},
+                "deleted_version_uids": {"type": "array", "items": {"type": "string"}},
+                "deleted_version_count": {"type": "integer"},
+                "deleted_provenance_event_count": {"type": "integer"},
+                "provenance_cleared": {"type": "boolean"},
+                "version": {"$ref": "#/components/schemas/UiPipelineVersionSummary"},
+                "graph": {"$ref": "#/components/schemas/ReactFlowGraph"},
+                "chat_reset": {"type": "boolean"},
+                "storage_cleanup": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
             },
             "additionalProperties": True,
         },
