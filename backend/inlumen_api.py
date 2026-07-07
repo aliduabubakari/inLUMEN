@@ -32,6 +32,7 @@ from provenance_provo import build_prov_o_jsonld, provenance_prov_o_filename
 from provenance_report import build_provenance_pdf, provenance_report_filename
 from public_api import create_public_api_blueprint
 from runtime_config import add_cors_headers, get_service_port
+from semt import create_semt_blueprint
 
 
 INLUMEN_API_PORT = get_service_port("INLUMEN_API_PORT", 5000)
@@ -59,6 +60,7 @@ CHATBOT_CONFIGS_PATH = Path(
 app = Flask(__name__)
 app.register_blueprint(create_public_api_blueprint())
 app.register_blueprint(create_node_definitions_blueprint())
+app.register_blueprint(create_semt_blueprint())
 app.register_blueprint(create_generator_blueprint())
 app.add_url_rule(
     "/agentic_generate_dockerfiles",

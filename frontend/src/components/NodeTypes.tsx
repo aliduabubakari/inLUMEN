@@ -11,7 +11,7 @@ import {
   PanelLeft, 
   Clipboard,
   Database,
-  PlusCircle 
+  PlusCircle,
 } from 'lucide-react';
 import { normalizeType } from '@/features/nodes/nodeSchema';
 
@@ -22,6 +22,12 @@ interface NodeProps {
     type: string;
     content?: string;
     active?: boolean;
+    definition_id?: string;
+    implementation?: Record<string, unknown>;
+    configuration_status?: "unconfigured" | "valid" | "invalid";
+    generated_artifact?: {
+      status?: "current" | "stale";
+    };
   };
   selected: boolean;
 }
@@ -64,6 +70,12 @@ export const CustomNode: React.FC<NodeProps> = ({ data, selected }) => {
   const visualType = data.type === 'system' ? 'system' : normalizeType(data.type);
   const icon = icons[visualType as keyof typeof icons] || <PanelLeft className="w-4 h-4" />;
   const typeColor = getTypeColor(visualType);
+  const serviceId =
+    data.implementation &&
+    typeof data.implementation.service_id === "string"
+      ? data.implementation.service_id
+      : "";
+  const isSemT = data.definition_id?.startsWith("semt.");
   
   return (
     <div 
@@ -97,12 +109,46 @@ export const CustomNode: React.FC<NodeProps> = ({ data, selected }) => {
             {icon}
             {visualType}
           </Badge>
+          {data.configuration_status && (
+            <Badge
+              variant="outline"
+              className={cn(
+                "text-[10px] font-normal",
+                data.configuration_status === "valid"
+                  ? "border-emerald-500/40 text-emerald-300"
+                  : data.configuration_status === "invalid"
+                    ? "border-red-500/40 text-red-300"
+                    : "border-amber-500/40 text-amber-300",
+              )}
+            >
+              {data.configuration_status}
+            </Badge>
+          )}
         </div>
         
         <div className="text-sm font-medium">{data.label}</div>
         
         {data.description && (
           <div className="text-xs text-slate-300">{data.description}</div>
+        )}
+
+        {isSemT && serviceId && (
+          <div className="text-[11px] text-slate-300">
+            Service: <span className="font-medium text-slate-100">{serviceId}</span>
+          </div>
+        )}
+
+        {data.definition_id && data.generated_artifact?.status && (
+          <div
+            className={cn(
+              "text-[11px]",
+              data.generated_artifact.status === "current"
+                ? "text-emerald-300"
+                : "text-amber-300",
+            )}
+          >
+            Runtime: {data.generated_artifact.status}
+          </div>
         )}
 
         {data.content && (

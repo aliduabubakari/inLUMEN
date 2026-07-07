@@ -1,0 +1,170 @@
+{
+  "definitions": [
+    {
+      "id": "semt.setup",
+      "version": 1,
+      "base_type": "action",
+      "family": "semt",
+      "operation": "setup",
+      "palette": {
+        "label": "SemT Setup",
+        "description": "Authenticate with the SemT API and initialise all service managers",
+        "icon": "key",
+        "color": "cyan",
+        "order": 180
+      },
+      "editor": {
+        "kind": "semt",
+        "catalog": "setup"
+      },
+      "runtime": {
+        "generator": "semt",
+        "template": "setup.py.j2",
+        "base_image": "python:3.11-slim"
+      },
+      "default_implementation": {
+        "kind": "semt",
+        "operation": "setup",
+        "service_id": "semt_connection",
+        "parameters": {
+          "api_base_url": "",
+          "username": "",
+          "password": "",
+          "token": "",
+          "dataset_id": "114",
+          "table_name": "my_table"
+        },
+        "connection_ref": "default-semt"
+      }
+    },
+    {
+      "id": "semt.modification",
+      "version": 1,
+      "base_type": "action",
+      "family": "semt",
+      "operation": "modification",
+      "palette": {
+        "label": "SemT Modification",
+        "description": "Apply a deterministic SemT data modification",
+        "icon": "wand-sparkles",
+        "color": "cyan",
+        "order": 200
+      },
+      "editor": {
+        "kind": "semt",
+        "catalog": "modifications"
+      },
+      "runtime": {
+        "generator": "semt",
+        "template": "modification.py.j2",
+        "base_image": "python:3.11-slim"
+      },
+      "default_implementation": {
+        "kind": "semt",
+        "operation": "modification",
+        "service_id": "",
+        "parameters": {},
+        "connection_ref": "default-semt"
+      }
+    },
+    {
+      "id": "semt.reconciliation",
+      "version": 1,
+      "base_type": "action",
+      "family": "semt",
+      "operation": "reconciliation",
+      "palette": {
+        "label": "SemT Reconciliation",
+        "description": "Reconcile a column using a supported SemT service",
+        "icon": "git-compare",
+        "color": "fuchsia",
+        "order": 210
+      },
+      "editor": {
+        "kind": "semt",
+        "catalog": "reconciliators"
+      },
+      "runtime": {
+        "generator": "semt",
+        "template": "reconciliation.py.j2",
+        "base_image": "python:3.11-slim"
+      },
+      "default_implementation": {
+        "kind": "semt",
+        "operation": "reconciliation",
+        "service_id": "",
+        "parameters": {
+          "optional_columns": []
+        },
+        "connection_ref": "default-semt"
+      }
+    },
+    {
+      "id": "semt.extension",
+      "version": 1,
+      "base_type": "action",
+      "family": "semt",
+      "operation": "extension",
+      "palette": {
+        "label": "SemT Extension",
+        "description": "Extend a column using a supported SemT service",
+        "icon": "list-plus",
+        "color": "orange",
+        "order": 220
+      },
+      "editor": {
+        "kind": "semt",
+        "catalog": "extenders"
+      },
+      "runtime": {
+        "generator": "semt",
+        "template": "extension.py.j2",
+        "base_image": "python:3.11-slim"
+      },
+      "default_implementation": {
+        "kind": "semt",
+        "operation": "extension",
+        "service_id": "",
+        "parameters": {
+          "properties": [],
+          "other_params": {},
+          "extra_key_columns": []
+        },
+        "connection_ref": "default-semt"
+      }
+    },
+    {
+      "id": "semt.export",
+      "version": 1,
+      "base_type": "output",
+      "family": "semt",
+      "operation": "export",
+      "palette": {
+        "label": "SemT Export",
+        "description": "Export the final SemT table to CSV or JSON",
+        "icon": "file-output",
+        "color": "cyan",
+        "order": 230
+      },
+      "editor": {
+        "kind": "semt",
+        "catalog": "export"
+      },
+      "runtime": {
+        "generator": "semt",
+        "template": "export.py.j2",
+        "base_image": "python:3.11-slim"
+      },
+      "default_implementation": {
+        "kind": "semt",
+        "operation": "export",
+        "service_id": "export_table",
+        "parameters": {
+          "output_format": "json",
+          "output_filename": "exported_data"
+        },
+        "connection_ref": "default-semt"
+      }
+    }
+  ]
+}

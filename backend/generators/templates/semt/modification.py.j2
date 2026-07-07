@@ -1,0 +1,129 @@
+# ---------------------------------------------------------------------------
+# Modification-specific helpers
+# ---------------------------------------------------------------------------
+
+def _build_modifier_props() -> dict[str, Any]:
+    """Translate catalog parameters into the props dict for manager.modify()."""
+    props: dict[str, Any] = {}
+    column_name = str(PARAMETERS.get("column_name") or "")
+    selected_cols: list[str] = []
+
+    if column_name:
+        selected_cols.append(column_name)
+
+    for key, value in PARAMETERS.items():
+        if key in (
+            "api_base_url", "username", "password", "token",
+            "dataset_id", "table_id", "connection_ref",
+        ):
+            continue
+        if key == "column_name":
+            continue
+        # columnToJoin provides additional columns (textColumnsTransformer, llmModifier)
+        if key == "columnToJoin":
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item.strip() and item.strip() not in selected_cols:
+                        selected_cols.append(item.strip())
+            continue
+        if isinstance(value, dict):
+            props[key] = value
+        elif isinstance(value, list):
+            props[key] = value
+        elif isinstance(value, bool):
+            props[key] = value
+        elif isinstance(value, (int, float)):
+            props[key] = value
+        elif isinstance(value, str) and value.strip():
+            props[key] = value
+
+    if selected_cols:
+        props["selectedColumns"] = selected_cols
+
+    return props
+
+
+def _backend_modify(
+    table: dict[str, Any],
+    dataset_id: str,
+    table_id: str,
+    modifier_name: str,
+    column_name: str,
+    props: dict[str, Any],
+) -> dict[str, Any]:
+    """Perform modification via the SemT backend: fetch → modify → push."""
+    base_url = _resolve_api_base_url()
+
+    auth_manager = build_auth_manager()
+    token = auth_manager.get_token()
+
+    modification_manager = ModificationManager(base_url.rstrip("/"), token)
+    table_manager = TableManager(base_url.rstrip("/"), auth_manager)
+    utility = Utility(base_url.rstrip("/"), auth_manager)
+
+    LOGGER.info("Fetching table %s from dataset %s", table_id, dataset_id)
+    table_data = table_manager.get_table(dataset_id, table_id)
+    if not isinstance(table_data, dict):
+        raise RuntimeError(
+            f"Failed to retrieve table {table_id} from dataset {dataset_id}."
+        )
+
+    LOGGER.info(
+        "Modifying column=%s  modifier=%s  props=%s",
+        column_name, modifier_name,
+        json.dumps(props, sort_keys=True),
+    )
+    modified_table, backend_payload = modification_manager.modify(
+        table=table_data,
+        column_name=column_name,
+        modifier_name=modifier_name,
+        props=props,
+    )
+
+    LOGGER.info("Pushing modified table back to backend ...")
+    success_msg, _ = utility.push_to_backend(
+        dataset_id, table_id, backend_payload
+    )
+    LOGGER.info(success_msg)
+
+    return modified_table
+
+
+# ---------------------------------------------------------------------------
+# Operation entry point
+# ---------------------------------------------------------------------------
+
+def execute_operation(table: dict[str, Any]) -> dict[str, Any]:
+    """Modify a column using a SemT modifier service.
+
+    In backend mode (dataset_id + table_id available from the input envelope)
+    the table is fetched from / pushed to the SemT backend automatically.
+    In file mode the table is processed locally (legacy / testing).
+    """
+    modifier_name = SERVICE_ID
+    column_name = str(PARAMETERS.get("column_name") or "")
+    props = _build_modifier_props()
+
+    dataset_id = _DATASET_ID or str(PARAMETERS.get("dataset_id") or "").strip()
+    table_id = _TABLE_ID or str(PARAMETERS.get("table_id") or "").strip()
+
+    if dataset_id and table_id:
+        return _backend_modify(table, dataset_id, table_id, modifier_name, column_name, props)
+
+    # ── File-based fallback (legacy / tests) ────────────────────────────
+    import pandas as pd
+    frame = table_to_dataframe(table)
+    target_col = column_name or frame.columns[0]
+
+    if modifier_name == "dataCleaning":
+        op = str(props.get("operationType", "toLowercase"))
+        if op == "toLowercase":
+            frame[target_col] = frame[target_col].astype(str).str.lower()
+        elif op == "toUppercase":
+            frame[target_col] = frame[target_col].astype(str).str.upper()
+        elif op == "toTitlecase":
+            frame[target_col] = frame[target_col].astype(str).str.title()
+        elif op == "trim":
+            frame[target_col] = frame[target_col].astype(str).str.strip()
+
+    return dataframe_to_table(frame, previous=table)

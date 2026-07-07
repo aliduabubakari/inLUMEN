@@ -5,13 +5,16 @@ from typing import Any
 from node_definitions import get_node_definition_registry
 
 from .base import GeneratedRuntimeArtifacts, NodeGenerator
+from .semt_generator import SemTGenerator
 
 
 class GeneratorRegistry:
     """Resolve deterministic node generators from node-definition manifests."""
 
     def __init__(self, generators: dict[str, NodeGenerator] | None = None):
-        self._generators: dict[str, NodeGenerator] = generators or {}
+        self._generators: dict[str, NodeGenerator] = generators or {
+            "semt": SemTGenerator(),
+        }
 
     def get(self, generator_name: str) -> NodeGenerator | None:
         return self._generators.get(str(generator_name or "").strip())

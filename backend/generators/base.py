@@ -34,6 +34,10 @@ def node_image_reference(flow_id: str, configuration_hash: str, *, prefix: str) 
     return f"{registry}/inlumen/{normalized_prefix}-{normalized_flow_id}:{hash_value[:12]}"
 
 
+def semt_image_reference(flow_id: str, configuration_hash: str) -> str:
+    return node_image_reference(flow_id, configuration_hash, prefix="semt")
+
+
 @dataclass(frozen=True)
 class GeneratedFile:
     filename: str
